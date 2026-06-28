@@ -1,0 +1,30 @@
+# Dockerfile — Main Agent Service
+# LangGraph supervisor with LiteLLM routing
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency definitions and install
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e "."
+
+# Copy source code
+COPY langgraph/ ./langgraph/
+COPY mcp_server/ ./mcp_server/
+
+# Expose agent service port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run supervisor agent (with MCP server as subprocess)
+CMD ["python", "-m", "langgraph.agent"]

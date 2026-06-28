@@ -1,0 +1,22 @@
+# Dockerfile — MCP Server
+# Lightweight Python image for the MCP tool server
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency definitions and install
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e "."
+
+# Copy source code
+COPY mcp_server/ ./mcp_server/
+
+# Run MCP server via stdio transport
+# LangGraph will spawn this as a subprocess
+CMD ["python", "-m", "mcp_server.main"]
