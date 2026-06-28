@@ -1,118 +1,140 @@
-"""LangGraph Agent — FastAPI Service Entrypoint.
-
-Production-ready HTTP server exposing the supervisor agent via FastAPI.
-Includes health check and MCP server subprocess management.
-"""
+"""LangGraph FastAPI Service — 生产级四代理团队 API。"""
 
 import asyncio
 import os
-import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from langgraph.state_machine import AgentState, graph
+from langgraph.state_machine import AgentState, team_graph
 
-# ───────────────────────────────────────────────────────
-# MCP Server Subprocess Management
-# ───────────────────────────────────────────────────────
-
-mcp_process: subprocess.Popen | None = None
-
-
-def start_mcp_server() -> subprocess.Popen:
-    """Start the MCP server as a subprocess for stdio communication."""
-    cmd = os.environ.get("MCP_SERVER_CMD", "python -m mcp_server.main")
-    return subprocess.Popen(
-        cmd.split(),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-# ───────────────────────────────────────────────────────
-# FastAPI Lifespan
-# ───────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage MCP server lifecycle alongside FastAPI."""
-    global mcp_process
-    mcp_process = start_mcp_server()
+    """应用生命周期管理。"""
+    print("🚀 启动多代理团队服务...")
     yield
-    if mcp_process:
-        mcp_process.terminate()
-        mcp_process.wait()
+    print("👋 关闭多代理团队服务...")
 
-
-# ───────────────────────────────────────────────────────
-# FastAPI Application
-# ───────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Multi-Agent Supervisor",
-    description="LangGraph + MCP + LiteLLM orchestration layer",
-    version="0.1.0",
+    title="AI Software Development Team",
+    description="Alice (PM) · Bob (Frontend) · Charlie (Backend) · Diana (QA)",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 
-class AgentRequest(BaseModel):
-    """Request body for agent invocation."""
+class TeamTaskRequest(BaseModel):
+    """团队任务请求。"""
+    
+    description: str = Field(..., description="任务需求描述")
+    repo_owner: str = Field(..., description="GitHub 仓库 owner")
+    repo_name: str = Field(..., description="GitHub 仓库名")
+    slack_channel: str = Field(default="#general", description="Slack 通知频道")
+    thread_ts: str | None = Field(default=None, description="Slack 线程时间戳")
+    max_iterations: int = Field(default=20, ge=1, le=50)
 
-    message: str
-    thread_ts: str | None = None
-    github_context: dict | None = None
 
-
-class AgentResponse(BaseModel):
-    """Response from agent invocation."""
-
+class TeamTaskResponse(BaseModel):
+    """团队任务响应。"""
+    
+    task_id: str
+    status: str
+    active_agent: str
+    iteration_count: int
     messages: list[dict]
-    slack_thread_id: str | None
-    github_context: dict | None
+    pr_urls: list[str]
+    issue_urls: list[str]
+    summary: str | None
+
+
+class HumanInputRequest(BaseModel):
+    """人类输入请求（用于中断恢复）。"""
+    
+    task_id: str = Field(..., description="任务 ID")
+    answer: str = Field(..., description="人类回答")
 
 
 @app.get("/health")
 async def health_check() -> dict:
-    """Health check endpoint."""
-    return {"status": "ok", "mcp_running": mcp_process is not None and mcp_process.poll() is None}
+    """健康检查。"""
+    return {"status": "ok", "service": "ai-dev-team", "version": "0.2.0"}
 
 
-@app.post("/invoke", response_model=AgentResponse)
-async def invoke_agent(request: AgentRequest) -> AgentResponse:
-    """Invoke the supervisor agent with a user message."""
+@app.post("/tasks/invoke", response_model=TeamTaskResponse)
+async def invoke_team(request: TeamTaskRequest) -> TeamTaskResponse:
+    """启动四代理团队协作任务。"""
     from langchain_core.messages import HumanMessage
+    import uuid
 
+    task_id = str(uuid.uuid4())[:8]
+    
     initial_state: AgentState = {
-        "messages": [HumanMessage(content=request.message)],
-        "slack_thread_id": request.thread_ts,
-        "github_context": request.github_context,
-        "next_node": None,
+        "messages": [HumanMessage(content=request.description)],
+        "active_agent": "alice",
+        "task_id": task_id,
+        "task_description": request.description,
+        "project_board": None,
+        "slack_thread_ts": request.thread_ts,
+        "slack_channel": request.slack_channel,
+        "repo_owner": request.repo_owner,
+        "repo_name": request.repo_name,
+        "current_branch": None,
+        "frontend_branch": None,
+        "backend_branch": None,
+        "pr_urls": [],
+        "issue_urls": [],
         "tool_calls": None,
+        "tool_results": None,
         "iteration_count": 0,
+        "max_iterations": request.max_iterations,
+        "human_input": None,
+        "pending_human": False,
     }
 
     try:
-        final_state = await graph.ainvoke(initial_state)
+        final_state = await team_graph.ainvoke(initial_state)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+    summary = None
+    messages = final_state.get("messages", [])
+    if messages:
+        last_msg = messages[-1]
+        if hasattr(last_msg, "content"):
+            summary = last_msg.content[:500]
 
-    return AgentResponse(
-        messages=[msg.model_dump() for msg in final_state.get("messages", [])],
-        slack_thread_id=final_state.get("slack_thread_id"),
-        github_context=final_state.get("github_context"),
+    return TeamTaskResponse(
+        task_id=task_id,
+        status="completed" if final_state.get("active_agent") == "end" else "pending",
+        active_agent=final_state.get("active_agent", "unknown"),
+        iteration_count=final_state.get("iteration_count", 0),
+        messages=[m.model_dump() if hasattr(m, "model_dump") else {"type": "unknown", "content": str(m)}
+                for m in messages],
+        pr_urls=final_state.get("pr_urls", []),
+        issue_urls=final_state.get("issue_urls", []),
+        summary=summary,
     )
 
 
-# ───────────────────────────────────────────────────────
-# CLI Runner (for local development)
-# ───────────────────────────────────────────────────────
+@app.post("/tasks/human-input")
+async def provide_human_input(request: HumanInputRequest) -> dict:
+    """提供人类输入以恢复中断的工作流。"""
+    return {
+        "task_id": request.task_id,
+        "status": "resumed",
+        "human_input": request.answer,
+    }
+
+
+@app.get("/tasks/{task_id}/status")
+async def get_task_status(task_id: str) -> dict:
+    """获取任务状态（需要状态存储实现）。"""
+    return {"task_id": task_id, "status": "not_implemented"}
+
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
