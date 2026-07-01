@@ -1,0 +1,218 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 04/10] HIGH: Structured agent routing with Pydantic output
+
+String-matching LLM output is fragile and non-deterministic.
+Use Pydantic-structured output to enforce valid routing decisions.
+
+--- langgraph/state_machine.py
++++ langgraph/state_machine.py
+@@ -48,12 +48,44 @@
+ class RoutingDecision(BaseModel):
+     """Structured routing decision from Alice."""
+     next_agent: Literal["bob", "charlie", "diana", "human", "end"] = Field(
+         ..., description="Which agent to route to next"
+     )
+     reason: str = Field(..., description="Brief reason for routing decision")
+     task_for_next: str | None = Field(
+         default=None, description="Specific task description for the next agent"
+     )
+ 
++class QARoutingDecision(BaseModel):
++    """Structured routing decision from Diana (QA)."""
++    action: Literal["approve", "reject_frontend", "reject_backend", "escalate"] = Field(
++        ..., description="QA decision: approve, reject with target, or escalate"
++    )
++    reason: str = Field(..., description="Reason for the decision")
++    issue_details: str | None = Field(
++        default=None, description="If rejecting, specific issues found"
++    )
++
++class DevCompletion(BaseModel):
++    """Structured completion signal from Bob/Charlie."""
++    is_complete: bool = Field(..., description="Whether the assigned task is complete")
++    summary: str = Field(..., description="What was accomplished")
++    needs_human: bool = Field(default=False, description="Whether human input is needed")
++    human_question: str | None = Field(
++        default=None, description="Question for human if needs_human is true"
++    )
++
++def _get_llm_with_structured(model: str, schema: type):
++    """Get LLM configured for structured output with the given schema."""
++    llm = get_llm(model)
++    return llm.with_structured_output(schema)
++
+ 
+ # ───────────────────────────────────────────────────────
+ # 节点函数
+ # ───────────────────────────────────────────────────────
+ 
+ def alice_node(state: AgentState) -> dict:
+     """Alice (PM) 节点：需求分析、任务分解、路由决策。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Alice executing iteration {iteration}")
+     
+-    llm = get_llm().bind_tools([])
++    router = _get_llm_with_structured("gpt-4o", RoutingDecision)
+     prompt = create_alice_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+         messages = [SystemMessage(content="你是项目经理 Alice。")] + messages
+     
+-    response = llm.invoke(messages)
+-    content = response.content.lower() if hasattr(response, "content") else ""
+-    
+-    if "bob" in content or "前端" in content:
+-        next_agent = "bob"
+-    elif "charlie" in content or "后端" in content:
+-        next_agent = "charlie"
+-    elif "diana" in content or "qa" in content or "测试" in content:
+-        next_agent = "diana"
+-    elif "human" in content or "ask_human" in content or "人类" in content:
+-        next_agent = "human"
+-    elif "完成" in content or "done" in content or "end" in content:
+-        next_agent = "end"
+-    else:
+-        if state.get("frontend_branch") and not state.get("backend_branch"):
+-            next_agent = "charlie"
+-        elif state.get("backend_branch") and not state.get("frontend_branch"):
+-            next_agent = "bob"
+-        else:
+-            next_agent = "bob"
++    try:
++        decision: RoutingDecision = router.invoke(messages)
++        next_agent = decision.next_agent
++        logger.info(f"[task:{task_id}] Alice routing to {next_agent}: {decision.reason}")
++    except Exception as e:
++        logger.warning(f"[task:{task_id}] Alice routing failed ({e}), using fallback")
++        if state.get("frontend_branch") and not state.get("backend_branch"):
++            next_agent = "charlie"
++        elif state.get("backend_branch") and not state.get("frontend_branch"):
++            next_agent = "bob"
++        elif state.get("frontend_branch") and state.get("backend_branch"):
++            next_agent = "diana"
++        else:
++            next_agent = "bob"
++    
++    if iteration >= state.get("max_iterations", 20) - 5:
++        logger.warning(f"[task:{task_id}] Approaching max iterations ({iteration}/{state.get('max_iterations', 20)})")
+     
+     return {
+         "messages": [response],
+         "active_agent": next_agent,
+         "iteration_count": iteration + 1,
+     }
+ 
+ 
+ def bob_node(state: AgentState) -> dict:
+     """Bob (Frontend) 节点：实现前端代码。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Bob executing iteration {iteration}")
+     
+-    llm = get_llm().bind_tools([])
++    completion_check = _get_llm_with_structured("gpt-4o", DevCompletion)
+     prompt = create_bob_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+         messages = [SystemMessage(content="你是前端开发 Bob。")] + messages
+     
+-    response = llm.invoke(messages)
+-    content = response.content.lower() if hasattr(response, "content") else ""
++    response = completion_check.invoke(messages)
+     
+-    if "完成" in content or "done" in content or "ready" in content:
++    if response.is_complete:
++        logger.info(f"[task:{task_id}] Bob completed: {response.summary[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     
+-    if "ask_human" in content or "确认" in content:
++    if response.needs_human:
++        logger.info(f"[task:{task_id}] Bob requesting human input")
+         return {"messages": [response], "active_agent": "human", "pending_human": True, "iteration_count": iteration + 1}
+     
++    logger.debug(f"[task:{task_id}] Bob continuing work")
+     return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
+ 
+ 
+ def charlie_node(state: AgentState) -> dict:
+     """Charlie (Backend) 节点：实现后端代码。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Charlie executing iteration {iteration}")
+     
+-    llm = get_llm().bind_tools([])
++    completion_check = _get_llm_with_structured("gpt-4o", DevCompletion)
+     prompt = create_charlie_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+         messages = [SystemMessage(content="你是后端开发 Charlie。")] + messages
+     
+-    response = llm.invoke(messages)
+-    content = response.content.lower() if hasattr(response, "content") else ""
++    response = completion_check.invoke(messages)
+     
+-    if "完成" in content or "done" in content or "ready" in content:
++    if response.is_complete:
++        logger.info(f"[task:{task_id}] Charlie completed: {response.summary[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     
+-    if "ask_human" in content or "确认" in content:
++    if response.needs_human:
++        logger.info(f"[task:{task_id}] Charlie requesting human input")
+         return {"messages": [response], "active_agent": "human", "pending_human": True, "iteration_count": iteration + 1}
+     
++    logger.debug(f"[task:{task_id}] Charlie continuing work")
+     return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
+ 
+ 
+ def diana_node(state: AgentState) -> dict:
+     """Diana (QA) 节点：代码审查和验收。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Diana executing iteration {iteration}")
+     
+-    llm = get_llm().bind_tools([])
++    qa_check = _get_llm_with_structured("gpt-4o", QARoutingDecision)
+     prompt = create_diana_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+         messages = [SystemMessage(content="你是 QA 工程师 Diana。")] + messages
+     
+-    response = llm.invoke(messages)
+-    content = response.content.lower() if hasattr(response, "content") else ""
++    try:
++        decision: QARoutingDecision = qa_check.invoke(messages)
++    except Exception:
++        logger.error(f"[task:{task_id}] Diana routing parse failed, escalating to Alice")
++        return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     
+-    if "bug" in content or "错误" in content or "issue" in content or "问题" in content:
+-        if "frontend" in content or "bob" in content or "前端" in content:
+-            return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
+-        elif "backend" in content or "charlie" in content or "后端" in content:
+-            return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
+-        else:
+-            return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+-    
+-    if "approve" in content or "pass" in content or "通过" in content or "验收" in content:
++    if decision.action == "reject_frontend":
++        logger.info(f"[task:{task_id}] Diana rejected frontend: {decision.reason[:100]}")
++        return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
++    elif decision.action == "reject_backend":
++        logger.info(f"[task:{task_id}] Diana rejected backend: {decision.reason[:100]}")
++        return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
++    elif decision.action == "escalate":
++        logger.info(f"[task:{task_id}] Diana escalating: {decision.reason[:100]}")
++        return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
++    elif decision.action == "approve":
++        logger.info(f"[task:{task_id}] Diana approved: {decision.reason[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+-    
++    else:
++        logger.warning(f"[task:{task_id}] Diana unknown action '{decision.action}', escalating")
++        return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}

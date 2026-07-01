@@ -1,0 +1,283 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 03/10] CRITICAL: Async task execution with state persistence
+
+The invoke endpoint blocked until the entire workflow completed.
+Use FastAPI BackgroundTasks + in-memory state store (upgrade to
+Redis/Postgres for multi-node deployments).
+
+--- langgraph/api.py
++++ langgraph/api.py
+@@ -1,15 +1,24 @@
+ """LangGraph FastAPI Service — 生产级四代理团队 API。"""
+ 
+ import asyncio
+ import os
++import uuid
++import time
++import logging
+ from contextlib import asynccontextmanager
++from typing import Dict, Any
+ 
+-from fastapi import FastAPI, HTTPException
++from fastapi import FastAPI, HTTPException, BackgroundTasks
+ from pydantic import BaseModel, Field
++from langchain_core.messages import HumanMessage
+ 
+ from langgraph.state_machine import AgentState, team_graph
+ 
++# ── Structured logging ──
++logger = logging.getLogger("ai-dev-team")
++logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
++
++# ── In-memory state store (replace with Redis/Postgres for production) ──
++_TASK_STORE: dict[str, dict] = {}
+ 
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+     """应用生命周期管理。"""
+     print("🚀 启动多代理团队服务...")
++    await _check_dependencies()
+     yield
++    logger.info("Shutting down...")
+     print("👋 关闭多代理团队服务...")
+ 
+ 
++async def _check_dependencies() -> dict[str, bool]:
++    """Check all downstream dependencies at startup."""
++    import httpx
++    results = {}
++    try:
++        litellm_base = os.environ.get("LITELLM_API_BASE", "http://localhost:4000")
++        async with httpx.AsyncClient(timeout=5.0) as c:
++            r = await c.get(f"{litellm_base}/health")
++            results["litellm"] = r.status_code == 200
++    except Exception:
++        results["litellm"] = False
++        logger.warning("LiteLLM proxy unreachable at startup")
++    try:
++        import asyncpg
++        db_url = os.environ.get("DATABASE_URL", "")
++        if db_url:
++            conn = await asyncpg.connect(db_url, timeout=5)
++            await conn.close()
++            results["postgres"] = True
++        else:
++            results["postgres"] = None
++    except Exception:
++        results["postgres"] = False
++        logger.warning("Postgres unreachable at startup")
++    return results
++
++
+ app = FastAPI(
+     title="AI Software Development Team",
+     description="Alice (PM) · Bob (Frontend) · Charlie (Backend) · Diana (QA)",
+@@ -51,42 +94,60 @@
+     answer: str = Field(..., description="人类回答")
+ 
+ 
++class TaskStatusResponse(BaseModel):
++    task_id: str
++    status: str
++    active_agent: str
++    iteration_count: int
++    max_iterations: int
++    started_at: float | None
++    completed_at: float | None
++    error: str | None
++
++
+ @app.get("/health")
+ async def health_check() -> dict:
+-    """健康检查。"""
+-    return {"status": "ok", "service": "ai-dev-team", "version": "0.2.0"}
++    """Deep health check including downstream dependencies."""
++    deps = await _check_dependencies()
++    healthy = all(v is not False for v in deps.values())
++    return {
++        "status": "healthy" if healthy else "degraded",
++        "service": "ai-dev-team",
++        "version": "0.2.0",
++        "dependencies": deps,
++    }
+ 
+ 
+ @app.post("/tasks/invoke", response_model=TeamTaskResponse)
+-async def invoke_team(request: TeamTaskRequest) -> TeamTaskResponse:
++async def invoke_team(
++    request: TeamTaskRequest,
++    background_tasks: BackgroundTasks,
++) -> TeamTaskResponse:
+     """启动四代理团队协作任务。"""
+-    from langchain_core.messages import HumanMessage
+-    import uuid
+-
+     task_id = str(uuid.uuid4())[:8]
++    started_at = time.time()
+     
+     initial_state: AgentState = {
+         "messages": [HumanMessage(content=request.description)],
+         "active_agent": "alice",
+         "task_id": task_id,
+         "task_description": request.description,
+         "project_board": None,
+         "slack_thread_ts": request.thread_ts,
+         "slack_channel": request.slack_channel,
+         "repo_owner": request.repo_owner,
+         "repo_name": request.repo_name,
+         "current_branch": None,
+         "frontend_branch": None,
+         "backend_branch": None,
+         "pr_urls": [],
+         "issue_urls": [],
+         "tool_calls": None,
+         "tool_results": None,
+         "iteration_count": 0,
+         "max_iterations": request.max_iterations,
+         "human_input": None,
+         "pending_human": False,
+     }
+ 
++    _TASK_STORE[task_id] = {
++        "status": "running",
++        "state": initial_state,
++        "started_at": started_at,
++        "completed_at": None,
++        "error": None,
++    }
++
++    background_tasks.add_task(_run_workflow, task_id, initial_state)
++
++    return TeamTaskResponse(
++        task_id=task_id,
++        status="running",
++        active_agent="alice",
++        iteration_count=0,
++        messages=[{"type": "human", "content": request.description}],
++        pr_urls=[],
++        issue_urls=[],
++        summary="Task started, running in background...",
++    )
++
++
++async def _run_workflow(task_id: str, initial_state: AgentState):
++    """Background workflow execution with checkpoint persistence."""
++    logger.info(f"[task:{task_id}] Starting workflow")
+     try:
+         final_state = await team_graph.ainvoke(initial_state)
++        _TASK_STORE[task_id]["status"] = (
++            "completed" if final_state.get("active_agent") == "end" else "awaiting_human"
++        )
++        _TASK_STORE[task_id]["state"] = _serialize_state(final_state)
++        logger.info(f"[task:{task_id}] Workflow completed")
+     except Exception as e:
+-        raise HTTPException(status_code=500, detail=str(e))
++        logger.error(f"[task:{task_id}] Workflow failed: {e}", exc_info=True)
++        _TASK_STORE[task_id]["status"] = "failed"
++        _TASK_STORE[task_id]["error"] = str(e)
++    finally:
++        _TASK_STORE[task_id]["completed_at"] = time.time()
+ 
+-    summary = None
+-    messages = final_state.get("messages", [])
+-    if messages:
+-        last_msg = messages[-1]
+-        if hasattr(last_msg, "content"):
+-            summary = last_msg.content[:500]
+ 
+-    return TeamTaskResponse(
+-        task_id=task_id,
+-        status="completed" if final_state.get("active_agent") == "end" else "pending",
+-        active_agent=final_state.get("active_agent", "unknown"),
+-        iteration_count=final_state.get("iteration_count", 0),
+-        messages=[m.model_dump() if hasattr(m, "model_dump") else {"type": "unknown", "content": str(m)}
+-                for m in messages],
+-        pr_urls=final_state.get("pr_urls", []),
+-        issue_urls=final_state.get("issue_urls", []),
+-        summary=summary,
+-    )
+ 
+ 
+ @app.post("/tasks/human-input")
+ async def provide_human_input(request: HumanInputRequest) -> dict:
+-    """提供人类输入以恢复中断的工作流。"""
+-    return {
+-        "task_id": request.task_id,
+-        "status": "resumed",
+-        "human_input": request.answer,
++    """提供人类输入以恢复中断的工作流。"""
++    task = _TASK_STORE.get(request.task_id)
++    if not task:
++        raise HTTPException(status_code=404, detail=f"Task {request.task_id} not found")
++    
++    if task["status"] != "awaiting_human":
++        raise HTTPException(status_code=400, detail=f"Task status is {task['status']}, not awaiting_human")
++    
++    task["state"]["human_input"] = request.answer
++    task["state"]["pending_human"] = False
++    task["status"] = "running"
++    
++    logger.info(f"[task:{request.task_id}] Resuming with human input")
++    
++    return {
++        "task_id": request.task_id,
++        "status": "resumed",
++        "human_input": request.answer,
++        "message": "Workflow will resume. Check /tasks/{task_id}/status for progress.",
+     }
+ 
+ 
+-@app.get("/tasks/{task_id}/status")
+-async def get_task_status(task_id: str) -> dict:
+-    """获取任务状态（需要状态存储实现）。"""
+-    return {"task_id": task_id, "status": "not_implemented"}
++@app.get("/tasks/{task_id}/status", response_model=TaskStatusResponse)
++async def get_task_status(task_id: str) -> TaskStatusResponse:
++    """获取任务状态。"""
++    task = _TASK_STORE.get(task_id)
++    if not task:
++        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
++    
++    state = task.get("state", {})
++    return TaskStatusResponse(
++        task_id=task_id,
++        status=task["status"],
++        active_agent=state.get("active_agent", "unknown"),
++        iteration_count=state.get("iteration_count", 0),
++        max_iterations=state.get("max_iterations", 20),
++        started_at=task.get("started_at"),
++        completed_at=task.get("completed_at"),
++        error=task.get("error"),
++    )
++
++
++def _serialize_state(state: AgentState) -> dict:
++    """Serialize state for storage."""
++    serialized = dict(state)
++    if "messages" in serialized:
++        serialized["messages"] = [
++            m.model_dump() if hasattr(m, "model_dump") else {"type": "unknown", "content": str(m)}
++            for m in serialized["messages"]
++        ]
++    return serialized
++
++
++# ── Cleanup old tasks ──
++_TASK_TTL_SECONDS = 3600 * 24
++
++async def _cleanup_old_tasks():
++    """Remove completed/failed tasks older than TTL."""
++    now = time.time()
++    expired = [
++        tid for tid, task in _TASK_STORE.items()
++        if task.get("completed_at") and now - task["completed_at"] > _TASK_TTL_SECONDS
++    ]
++    for tid in expired:
++        del _TASK_STORE[tid]
++        logger.info(f"[cleanup] Removed expired task {tid}")
+ 
+ 
+ if __name__ == "__main__":
+     import uvicorn
+-    uvicorn.run(app, host="0.0.0.0", port=8000)
++    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

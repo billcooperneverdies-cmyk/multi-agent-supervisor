@@ -1,0 +1,99 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 02/10] CRITICAL: LLM singleton + dependency injection
+
+Creating a new ChatOpenAI on every node call wastes memory and
+re-parses config. Use a module-level singleton with lazy init.
+
+--- langgraph/state_machine.py
++++ langgraph/state_machine.py
+@@ -35,15 +35,41 @@
+ # ───────────────────────────────────────────────────────
+ # LLM 初始化
+ # ───────────────────────────────────────────────────────
+-def get_llm(model: str = "gpt-4o") -> ChatOpenAI:
+-    """通过 LiteLLM 代理获取 LLM。"""
+-    import os
+-    return ChatOpenAI(
+-        model=model,
+-        api_key=os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key"),
+-        base_url=f"{os.environ.get('LITELLM_API_BASE', 'http://localhost:4000')}/v1",
+-        temperature=0.2,
+-    )
++
++_LLM_CACHE: dict[str, ChatOpenAI] = {}
++
++def get_llm(model: str = "gpt-4o") -> ChatOpenAI:
++    """通过 LiteLLM 代理获取 LLM（带缓存）。"""
++    if model in _LLM_CACHE:
++        return _LLM_CACHE[model]
++
++    import os
++    api_key = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
++    base_url = os.environ.get("LITELLM_API_BASE", "http://localhost:4000")
++
++    llm = ChatOpenAI(
++        model=model,
++        api_key=api_key,
++        base_url=f"{base_url}/v1",
++        temperature=0.2,
++        max_retries=3,
++        timeout=60,
++    )
++    _LLM_CACHE[model] = llm
++    return llm
++
++# ── Pre-bind tools once ──
++# TODO: Actually bind real tools here instead of empty list
++_TOOLS: list = []
++
++def get_llm_with_tools(model: str = "gpt-4o"):
++    """Get LLM with tools bound (cached)."""
++    llm = get_llm(model)
++    return llm.bind_tools(_TOOLS)
++
++def clear_llm_cache():
++    """Clear LLM cache (useful for testing)."""
++    _LLM_CACHE.clear()
+ 
+ 
+ # ───────────────────────────────────────────────────────
+ # 节点函数
+ # ───────────────────────────────────────────────────────
+ 
+ def alice_node(state: AgentState) -> dict:
+     """Alice (PM) 节点：需求分析、任务分解、路由决策。"""
+     messages = state["messages"]
+     iteration = state.get("iteration_count", 0)
+     
+-    llm = get_llm().bind_tools([])
++    llm = get_llm_with_tools()
+     prompt = create_alice_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+@@ -97,7 +123,7 @@
+     messages = state["messages"]
+     iteration = state.get("iteration_count", 0)
+     
+-    llm = get_llm().bind_tools([])
++    llm = get_llm_with_tools()
+     prompt = create_bob_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+@@ -125,7 +151,7 @@
+     messages = state["messages"]
+     iteration = state.get("iteration_count", 0)
+     
+-    llm = get_llm().bind_tools([])
++    llm = get_llm_with_tools()
+     prompt = create_charlie_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):
+@@ -153,7 +179,7 @@
+     messages = state["messages"]
+     iteration = state.get("iteration_count", 0)
+     
+-    llm = get_llm().bind_tools([])
++    llm = get_llm_with_tools()
+     prompt = create_diana_prompt()
+     
+     if not any(isinstance(m, SystemMessage) for m in messages):

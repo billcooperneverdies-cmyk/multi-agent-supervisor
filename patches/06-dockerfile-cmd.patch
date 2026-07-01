@@ -1,0 +1,17 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 06/10] MEDIUM: Dockerfile runs API server, not CLI
+
+The Dockerfile.agent was running the CLI interactive mode instead
+of the FastAPI server. Running it standalone would spin up an
+interactive TTY instead of an HTTP service.
+
+--- Dockerfile.agent
++++ Dockerfile.agent
+@@ -19,5 +19,5 @@
+ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+     CMD curl -f http://localhost:8000/health || exit 1
+ 
+-# Run supervisor agent (with MCP server as subprocess)
+-CMD ["python", "-m", "langgraph.agent"]
++# Run FastAPI production server (not CLI interactive mode)
++CMD ["uvicorn", "langgraph.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

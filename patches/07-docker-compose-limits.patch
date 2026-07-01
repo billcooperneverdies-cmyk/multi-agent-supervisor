@@ -1,0 +1,124 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 07/10] MEDIUM: Resource limits, restart policies, logging
+
+No resource limits means a runaway agent can consume all host
+resources. No log rotation means disks fill up.
+
+--- docker-compose.yml
++++ docker-compose.yml
+@@ -10,6 +10,13 @@
+       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+       POSTGRES_DB: ${POSTGRES_DB:-agent_db}
++    deploy:
++      resources:
++        limits:
++          cpus: '1.0'
++          memory: 512M
++        reservations:
++          cpus: '0.25'
++          memory: 128M
+     volumes:
+       - postgres_data:/var/lib/postgresql/data
+     ports:
+@@ -19,6 +26,9 @@
+       interval: 10s
+       timeout: 5s
+       retries: 5
++    logging:
++      driver: "json-file"
++      options:
++        max-size: "100m"
++        max-file: "3"
+     networks:
+       - agent-network
+ 
+@@ -30,6 +43,13 @@
+     image: ghcr.io/berriai/litellm:main-latest
+     container_name: agent-litellm
+     restart: unless-stopped
++    deploy:
++      resources:
++        limits:
++          cpus: '0.5'
++          memory: 256M
++        reservations:
++          cpus: '0.1'
++          memory: 64M
+     ports:
+       - "${LITELLM_PORT:-4000}:4000"
+     environment:
+@@ -46,6 +66,11 @@
+     depends_on:
+       postgres:
+         condition: service_healthy
++    logging:
++      driver: "json-file"
++      options:
++        max-size: "50m"
++        max-file: "3"
+     networks:
+       - agent-network
+     healthcheck:
+@@ -57,6 +82,13 @@
+   mcp-server:
+     build:
+       context: .
+       dockerfile: Dockerfile.mcp
+     container_name: agent-mcp
+     restart: unless-stopped
++    deploy:
++      resources:
++        limits:
++          cpus: '0.5'
++          memory: 256M
+     environment:
+       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+@@ -69,6 +101,13 @@
+     build:
+       context: .
+       dockerfile: Dockerfile.agent
+     container_name: agent-supervisor
+     restart: unless-stopped
++    deploy:
++      resources:
++        limits:
++          cpus: '2.0'
++          memory: 1G
++        reservations:
++          cpus: '0.5'
++          memory: 256M
+     ports:
+       - "${AGENT_PORT:-8000}:8000"
+     environment:
+@@ -84,12 +123,24 @@
+     depends_on:
+       postgres:
+         condition: service_healthy
+       litellm-proxy:
+         condition: service_healthy
++    logging:
++      driver: "json-file"
++      options:
++        max-size: "100m"
++        max-file: "5"
+     networks:
+       - agent-network
+ 
+   redis:
+     image: redis:7-alpine
+     container_name: agent-redis
+     restart: unless-stopped
++    deploy:
++      resources:
++        limits:
++          cpus: '0.25'
++          memory: 128M
++    logging:
++      driver: "json-file"
++      options:
++        max-size: "50m"
++        max-file: "3"
+     volumes:
+       - redis_data:/data
+     networks:
