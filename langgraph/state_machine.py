@@ -1,19 +1,27 @@
 """Multi-Agent LangGraph State Machine — Alice, Bob, Charlie, Diana Collaboration.
 
-四代理协作软件开发团队工作流：
-- Alice (PM): 需求分析 → 任务分配 → 进度跟踪 → 验收
-- Bob (Frontend): 接收任务 → 实现 UI → 提交代码 → 通知 QA
-- Charlie (Backend): 接收任务 → 实现 API → 提交代码 → 通知 QA
-- Diana (QA): 接收审查任务 → 代码审查 → Bug 报告 → 验收批准
+Four-agent collaborative software development workflow:
+- Alice (PM): Requirements → Task decomposition → Routing
+- Bob (Frontend): Receives tasks → Implements UI → Signals completion
+- Charlie (Backend): Receives tasks → Implements API → Signals completion
+- Diana (QA): Code review → Approve / Reject with structured routing
 """
+from __future__ import annotations
 
-from typing import Annotated, Optional, Literal, List
+import logging
+from typing import Annotated, Literal, Optional
 from typing_extensions import TypedDict
 
-from langchain_core.messages import AnyMessage, SystemMessage, ToolMessage, HumanMessage, AIMessage
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    SystemMessage,
+)
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
 
 from agents import (
     create_alice_prompt,
@@ -22,13 +30,42 @@ from agents import (
     create_diana_prompt,
 )
 
+logger = logging.getLogger("langgraph.state_machine")
 
-# ───────────────────────────────────────────────────────
-# AgentState — 多代理共享状态
-# ───────────────────────────────────────────────────────
+
+# ── Structured Output Schemas ───────────────────────────────────────────────
+
+class RoutingDecision(BaseModel):
+    """Alice's structured routing decision."""
+    next_agent: Literal["bob", "charlie", "diana", "human", "end"] = Field(
+        ..., description="Which agent to route to next"
+    )
+    reason: str = Field(..., description="Brief reason for routing decision")
+    task_for_next: str | None = Field(
+        default=None, description="Specific task for the next agent"
+    )
+
+
+class QARoutingDecision(BaseModel):
+    """Diana's structured QA decision."""
+    action: Literal["approve", "reject_frontend", "reject_backend", "escalate"] = Field(
+        ..., description="QA decision"
+    )
+    reason: str = Field(..., description="Reason for the decision")
+    issue_details: str | None = Field(default=None, description="Issues found if rejecting")
+
+
+class DevCompletion(BaseModel):
+    """Bob/Charlie structured completion signal."""
+    is_complete: bool = Field(..., description="Task is complete")
+    summary: str = Field(..., description="What was accomplished")
+    needs_human: bool = Field(default=False, description="Needs human input")
+    human_question: str | None = Field(default=None, description="Question for human")
+
+
+# ── AgentState ──────────────────────────────────────────────────────────────
+
 class AgentState(TypedDict):
-    """共享状态，由所有代理节点和工具节点读写。"""
-
     messages: Annotated[list[AnyMessage], add_messages]
     active_agent: Literal["alice", "bob", "charlie", "diana", "human", "end"]
     task_id: Optional[str]
@@ -51,154 +88,232 @@ class AgentState(TypedDict):
     pending_human: bool
 
 
-# ───────────────────────────────────────────────────────
-# LLM 初始化
-# ───────────────────────────────────────────────────────
+# ── LLM Singleton ───────────────────────────────────────────────────────────
+
+_LLM_CACHE: dict[str, ChatOpenAI] = {}
+
+
 def get_llm(model: str = "gpt-4o") -> ChatOpenAI:
-    """通过 LiteLLM 代理获取 LLM。"""
+    if model in _LLM_CACHE:
+        return _LLM_CACHE[model]
     import os
-    return ChatOpenAI(
+    llm = ChatOpenAI(
         model=model,
         api_key=os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key"),
         base_url=f"{os.environ.get('LITELLM_API_BASE', 'http://localhost:4000')}/v1",
         temperature=0.2,
+        max_retries=3,
+        timeout=60,
     )
+    _LLM_CACHE[model] = llm
+    return llm
 
 
-# ───────────────────────────────────────────────────────
-# 节点函数
-# ───────────────────────────────────────────────────────
+def clear_llm_cache() -> None:
+    _LLM_CACHE.clear()
+
+
+def _get_structured_llm(model: str, schema: type):
+    return get_llm(model).with_structured_output(schema)
+
+
+# ── Node Functions ──────────────────────────────────────────────────────────
+
+def _fallback_agent(state: AgentState) -> str:
+    fb = state.get("frontend_branch")
+    bb = state.get("backend_branch")
+    if fb and not bb:
+        return "charlie"
+    if bb and not fb:
+        return "bob"
+    if fb and bb:
+        return "diana"
+    return "bob"
+
 
 def alice_node(state: AgentState) -> dict:
-    """Alice (PM) 节点：需求分析、任务分解、路由决策。"""
+    """Alice (PM): Requirements analysis, task decomposition, routing."""
     messages = state["messages"]
+    task_id = state.get("task_id", "unknown")
     iteration = state.get("iteration_count", 0)
-    
-    llm = get_llm().bind_tools([])
+
+    logger.info("[task:%s] Alice executing iteration %d", task_id, iteration)
+
+    router = _get_structured_llm("gpt-4o", RoutingDecision)
     prompt = create_alice_prompt()
-    
+
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content="你是项目经理 Alice。")] + messages
-    
-    response = llm.invoke(messages)
-    content = response.content.lower() if hasattr(response, "content") else ""
-    
-    if "bob" in content or "前端" in content:
-        next_agent = "bob"
-    elif "charlie" in content or "后端" in content:
-        next_agent = "charlie"
-    elif "diana" in content or "qa" in content or "测试" in content:
-        next_agent = "diana"
-    elif "human" in content or "ask_human" in content or "人类" in content:
-        next_agent = "human"
-    elif "完成" in content or "done" in content or "end" in content:
-        next_agent = "end"
-    else:
-        if state.get("frontend_branch") and not state.get("backend_branch"):
-            next_agent = "charlie"
-        elif state.get("backend_branch") and not state.get("frontend_branch"):
-            next_agent = "bob"
-        else:
-            next_agent = "bob"
-    
+        messages = [SystemMessage(content="You are project manager Alice.")] + messages
+
+    try:
+        decision: RoutingDecision = router.invoke(messages)
+        next_agent = decision.next_agent
+        content = decision.reason
+        if decision.task_for_next:
+            content += f"\n\nTask: {decision.task_for_next}"
+        logger.info(
+            "[task:%s] Alice routing to %s: %s",
+            task_id, next_agent, decision.reason,
+        )
+    except Exception as exc:
+        next_agent = _fallback_agent(state)
+        content = f"Routing decision failed ({exc}), falling back to {next_agent}."
+        logger.warning("[task:%s] Alice routing failed: %s", task_id, exc)
+
+    ai_msg = AIMessage(content=content)
+
+    if iteration >= state.get("max_iterations", 20) - 3:
+        logger.warning(
+            "[task:%s] Approaching max iterations (%d/%d)",
+            task_id, iteration, state.get("max_iterations", 20),
+        )
+
     return {
-        "messages": [response],
+        "messages": [ai_msg],
         "active_agent": next_agent,
         "iteration_count": iteration + 1,
     }
 
 
 def bob_node(state: AgentState) -> dict:
-    """Bob (Frontend) 节点：实现前端代码。"""
+    """Bob (Frontend): Implement frontend code."""
     messages = state["messages"]
+    task_id = state.get("task_id", "unknown")
     iteration = state.get("iteration_count", 0)
-    
-    llm = get_llm().bind_tools([])
+
+    logger.info("[task:%s] Bob executing iteration %d", task_id, iteration)
+
+    checker = _get_structured_llm("gpt-4o", DevCompletion)
     prompt = create_bob_prompt()
-    
+
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content="你是前端开发 Bob。")] + messages
-    
-    response = llm.invoke(messages)
-    content = response.content.lower() if hasattr(response, "content") else ""
-    
-    if "完成" in content or "done" in content or "ready" in content:
-        return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
-    
-    if "ask_human" in content or "确认" in content:
-        return {"messages": [response], "active_agent": "human", "pending_human": True, "iteration_count": iteration + 1}
-    
-    return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
+        messages = [SystemMessage(content="You are frontend developer Bob.")] + messages
+
+    try:
+        result: DevCompletion = checker.invoke(messages)
+    except Exception as exc:
+        logger.error("[task:%s] Bob completion parse failed: %s", task_id, exc)
+        ai_msg = AIMessage(content=f"Working on the frontend implementation... (parse error: {exc})")
+        return {"messages": [ai_msg], "active_agent": "bob", "iteration_count": iteration + 1}
+
+    ai_msg = AIMessage(content=result.summary)
+
+    if result.is_complete:
+        logger.info("[task:%s] Bob completed: %s", task_id, result.summary[:100])
+        return {"messages": [ai_msg], "active_agent": "alice", "iteration_count": iteration + 1}
+
+    if result.needs_human:
+        logger.info("[task:%s] Bob requesting human input", task_id)
+        return {
+            "messages": [ai_msg],
+            "active_agent": "human",
+            "pending_human": True,
+            "iteration_count": iteration + 1,
+        }
+
+    logger.debug("[task:%s] Bob continuing work", task_id)
+    return {"messages": [ai_msg], "active_agent": "bob", "iteration_count": iteration + 1}
 
 
 def charlie_node(state: AgentState) -> dict:
-    """Charlie (Backend) 节点：实现后端代码。"""
+    """Charlie (Backend): Implement backend code."""
     messages = state["messages"]
+    task_id = state.get("task_id", "unknown")
     iteration = state.get("iteration_count", 0)
-    
-    llm = get_llm().bind_tools([])
+
+    logger.info("[task:%s] Charlie executing iteration %d", task_id, iteration)
+
+    checker = _get_structured_llm("gpt-4o", DevCompletion)
     prompt = create_charlie_prompt()
-    
+
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content="你是后端开发 Charlie。")] + messages
-    
-    response = llm.invoke(messages)
-    content = response.content.lower() if hasattr(response, "content") else ""
-    
-    if "完成" in content or "done" in content or "ready" in content:
-        return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
-    
-    if "ask_human" in content or "确认" in content:
-        return {"messages": [response], "active_agent": "human", "pending_human": True, "iteration_count": iteration + 1}
-    
-    return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
+        messages = [SystemMessage(content="You are backend developer Charlie.")] + messages
+
+    try:
+        result: DevCompletion = checker.invoke(messages)
+    except Exception as exc:
+        logger.error("[task:%s] Charlie completion parse failed: %s", task_id, exc)
+        ai_msg = AIMessage(content=f"Working on the backend implementation... (parse error: {exc})")
+        return {"messages": [ai_msg], "active_agent": "charlie", "iteration_count": iteration + 1}
+
+    ai_msg = AIMessage(content=result.summary)
+
+    if result.is_complete:
+        logger.info("[task:%s] Charlie completed: %s", task_id, result.summary[:100])
+        return {"messages": [ai_msg], "active_agent": "alice", "iteration_count": iteration + 1}
+
+    if result.needs_human:
+        logger.info("[task:%s] Charlie requesting human input", task_id)
+        return {
+            "messages": [ai_msg],
+            "active_agent": "human",
+            "pending_human": True,
+            "iteration_count": iteration + 1,
+        }
+
+    logger.debug("[task:%s] Charlie continuing work", task_id)
+    return {"messages": [ai_msg], "active_agent": "charlie", "iteration_count": iteration + 1}
 
 
 def diana_node(state: AgentState) -> dict:
-    """Diana (QA) 节点：代码审查和验收。"""
+    """Diana (QA): Code review and acceptance."""
     messages = state["messages"]
+    task_id = state.get("task_id", "unknown")
     iteration = state.get("iteration_count", 0)
-    
-    llm = get_llm().bind_tools([])
+
+    logger.info("[task:%s] Diana executing iteration %d", task_id, iteration)
+
+    qa = _get_structured_llm("gpt-4o", QARoutingDecision)
     prompt = create_diana_prompt()
-    
+
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content="你是 QA 工程师 Diana。")] + messages
-    
-    response = llm.invoke(messages)
-    content = response.content.lower() if hasattr(response, "content") else ""
-    
-    if "bug" in content or "错误" in content or "issue" in content or "问题" in content:
-        if "frontend" in content or "bob" in content or "前端" in content:
-            return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
-        elif "backend" in content or "charlie" in content or "后端" in content:
-            return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
-        else:
-            return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
-    
-    if "approve" in content or "pass" in content or "通过" in content or "验收" in content:
-        return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
-    
-    return {"messages": [response], "active_agent": "diana", "iteration_count": iteration + 1}
+        messages = [SystemMessage(content="You are QA engineer Diana.")] + messages
+
+    try:
+        decision: QARoutingDecision = qa.invoke(messages)
+    except Exception as exc:
+        logger.error("[task:%s] Diana routing parse failed, escalating: %s", task_id, exc)
+        ai_msg = AIMessage(content=f"QA routing failed ({exc}), escalating to Alice.")
+        return {"messages": [ai_msg], "active_agent": "alice", "iteration_count": iteration + 1}
+
+    ai_msg = AIMessage(content=f"{decision.reason}\n\nDetails: {decision.issue_details or 'N/A'}")
+
+    if decision.action == "approve":
+        logger.info("[task:%s] Diana approved: %s", task_id, decision.reason[:100])
+        return {"messages": [ai_msg], "active_agent": "end", "iteration_count": iteration + 1}
+
+    if decision.action == "reject_frontend":
+        logger.info("[task:%s] Diana rejected frontend: %s", task_id, decision.reason[:100])
+        return {"messages": [ai_msg], "active_agent": "bob", "iteration_count": iteration + 1}
+
+    if decision.action == "reject_backend":
+        logger.info("[task:%s] Diana rejected backend: %s", task_id, decision.reason[:100])
+        return {"messages": [ai_msg], "active_agent": "charlie", "iteration_count": iteration + 1}
+
+    logger.info("[task:%s] Diana escalating: %s", task_id, decision.reason[:100])
+    return {"messages": [ai_msg], "active_agent": "alice", "iteration_count": iteration + 1}
 
 
 def human_node(state: AgentState) -> dict:
-    """Human-in-the-Loop 节点：暂停工作流等待人类输入。"""
-    print("\n" + "="*60)
-    print("🛑 工作流暂停：等待人类输入")
-    print("="*60)
-    
+    """Human-in-the-Loop: Pause workflow for human input."""
+    task_id = state.get("task_id", "unknown")
+    logger.info("[task:%s] Workflow paused awaiting human input", task_id)
+
     last_message = state["messages"][-1] if state["messages"] else None
     if last_message and hasattr(last_message, "content"):
-        print(f"\n代理请求：{last_message.content}")
-    
+        print(f"\n{'='*60}")
+        print(f"🛑 Workflow paused — awaiting human input")
+        print(f"{'='*60}")
+        print(f"\nAgent request: {last_message.content[:200]}")
+
     try:
-        human_input = input("\n请输入您的回复（或输入 'continue' 继续）：")
+        human_input = input("\nYour reply (or 'continue'): ")
     except (EOFError, KeyboardInterrupt):
         human_input = "continue"
-    
-    human_msg = HumanMessage(content=f"[Human Input] {human_input}")
-    
+
+    human_msg = HumanMessage(content=f"[Human] {human_input}")
+    logger.info("[task:%s] Human input received: %s...", task_id, human_input[:50])
+
     return {
         "messages": [human_msg],
         "active_agent": "alice",
@@ -207,56 +322,36 @@ def human_node(state: AgentState) -> dict:
     }
 
 
-# ───────────────────────────────────────────────────────
-# 条件路由
-# ───────────────────────────────────────────────────────
+# ── Conditional Routing ─────────────────────────────────────────────────────
 
 def route_agent(state: AgentState) -> Literal["alice", "bob", "charlie", "diana", "human", "end"]:
-    """条件路由：根据 active_agent 状态字段决定下一个节点。"""
     active = state.get("active_agent", "alice")
     iteration = state.get("iteration_count", 0)
     max_iter = state.get("max_iterations", 20)
-    
+
     if iteration >= max_iter:
-        print(f"⚠️ 达到最大迭代次数 {max_iter}，强制终止工作流。")
+        logger.warning("Max iterations (%d) reached, terminating workflow", max_iter)
         return "end"
-    
+
     if state.get("pending_human"):
         return "human"
-    
+
     return active
 
 
-# ───────────────────────────────────────────────────────
-# 图构建
-# ───────────────────────────────────────────────────────
+# ── Graph Construction ──────────────────────────────────────────────────────
 
 def build_team_workflow() -> StateGraph:
-    """
-    构建四代理协作工作流图。
-    
-    ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
-    │  alice  │────▶│   bob   │     │ charlie │     │  diana  │     │  human  │
-    │  (PM)   │◄────│(前端)    │     │(后端)    │     │  (QA)   │     │(人类)   │
-    │  调度中心│     └────┬────┘     └────┬────┘     └────┬────┘     └────┬────┘
-    │         │◄──────────┘◄──────────────┘◄──────────────┘◄──────────────┘
-    └────┬────┘
-         │
-         ▼
-    ┌─────────┐
-    │   END   │
-    └─────────┘
-    """
     workflow = StateGraph(AgentState)
-    
+
     workflow.add_node("alice", alice_node)
     workflow.add_node("bob", bob_node)
     workflow.add_node("charlie", charlie_node)
     workflow.add_node("diana", diana_node)
     workflow.add_node("human", human_node)
-    
+
     workflow.set_entry_point("alice")
-    
+
     for node_name in ["alice", "bob", "charlie", "diana", "human"]:
         workflow.add_conditional_edges(
             node_name,
@@ -270,9 +365,8 @@ def build_team_workflow() -> StateGraph:
                 "end": END,
             },
         )
-    
+
     return workflow.compile()
 
 
-# 全局编译图
 team_graph = build_team_workflow()
