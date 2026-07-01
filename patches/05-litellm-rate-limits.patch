@@ -1,0 +1,70 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 05/10] MEDIUM: Enable rate limits and add budget controls
+
+Rate limits were commented out. A runaway agent loop will burn
+your API budget and get your key revoked.
+
+--- configs/litellm_proxy.yaml
++++ configs/litellm_proxy.yaml
+@@ -5,21 +5,40 @@
+   - model_name: gpt-4o
+     litellm_params:
+       model: openai/gpt-4o
+       api_key: os.environ/OPENAI_API_KEY
++      rpm: 100
++      tpm: 150000
++      timeout: 60
+ 
+   - model_name: claude-3-5-sonnet
+     litellm_params:
+       model: anthropic/claude-3-5-sonnet-20240620
+       api_key: os.environ/ANTHROPIC_API_KEY
++      rpm: 50
++      tpm: 80000
++      timeout: 60
+ 
+   - model_name: local-llm
+     litellm_params:
+       model: ollama/llama3.1
+       api_base: http://host.docker.internal:11434
++      rpm: 1000
++      timeout: 120
+ 
+ # General settings
+ general_settings:
+   master_key: os.environ/LITELLM_MASTER_KEY
+   database_url: os.environ/DATABASE_URL
+-  # Enable proxy admin UI
+   proxy_batch_write_at: 60
++  max_budget: 100.0
++  budget_duration: "1d"
++  alert_settings:
++    budget_alertEmails: ["admin@example.com"]
++  allowed_routes: ["/v1/chat/completions", "/v1/models", "/health"]
++  success_callback: ["langfuse"]
++  failure_callback: ["langfuse"]
+ 
+-# Rate limits
+-# model_list:
+-#   - model_name: gpt-4o
+-#     litellm_params:
+-#       model: openai/gpt-4o
+-#       rpm: 100
+-#       tpm: 100000
++# ── Router Settings ──
++router_settings:
++  routing_strategy: "least-busy"
++  timeout: 30
++  num_retries: 2
++  retry_after: 1
++
++# ── Guardrails ──
++guardrails:
++  - guardrail_name: "input-size-limit"
++    default_on: true
++    litellm_params:
++      max_input_tokens: 32000
++  - guardrail_name: "output-size-limit"
++    default_on: true
++    litellm_params:
++      max_output_tokens: 4096

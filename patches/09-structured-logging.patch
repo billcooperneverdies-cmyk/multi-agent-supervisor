@@ -1,0 +1,180 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 09/10] HIGH: Replace print() with structured logging
+
+print() statements are un-debuggable at scale. Use Python's
+logging module with structured context and correlation IDs.
+
+--- langgraph/state_machine.py
++++ langgraph/state_machine.py
+@@ -1,5 +1,7 @@
+ """Multi-Agent LangGraph State Machine — Alice, Bob, Charlie, Diana Collaboration."""
+ 
++import logging
++import time
+ from typing import Annotated, Optional, Literal, List
+ from typing_extensions import TypedDict
+ 
+@@ -11,6 +13,9 @@
+ from agents import (
+     create_alice_prompt, create_bob_prompt, create_charlie_prompt, create_diana_prompt,
+ )
+ 
++# ── Logger ──
++logger = logging.getLogger("langgraph.state_machine")
++
+ 
+ # ───────────────────────────────────────────────────────
+ # AgentState — 多代理共享状态
+ # ───────────────────────────────────────────────────────
+@@ -84,6 +89,8 @@
+ def alice_node(state: AgentState) -> dict:
+     """Alice (PM) 节点：需求分析、任务分解、路由决策。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Alice executing iteration {iteration}")
+     
+     # Use structured output for reliable routing
+     router = _get_llm_with_structured("gpt-4o", RoutingDecision)
+@@ -98,10 +105,13 @@
+     try:
+         decision: RoutingDecision = router.invoke(messages)
+         next_agent = decision.next_agent
++        logger.info(f"[task:{task_id}] Alice routing to {next_agent}: {decision.reason}")
+     except Exception as e:
++        logger.warning(f"[task:{task_id}] Alice routing failed ({e}), using fallback")
+         # Fallback: use deterministic routing based on state
+         if state.get("frontend_branch") and not state.get("backend_branch"):
+             next_agent = "charlie"
+         elif state.get("backend_branch") and not state.get("frontend_branch"):
+             next_agent = "bob"
+         elif state.get("frontend_branch") and state.get("backend_branch"):
+             next_agent = "diana"
+         else:
+             next_agent = "bob"
++    
++    if iteration >= state.get("max_iterations", 20) - 5:
++        logger.warning(f"[task:{task_id}] Approaching max iterations ({iteration}/{state.get('max_iterations', 20)})")
+     
+     return {
+         "messages": [response],
+         "active_agent": next_agent,
+         "iteration_count": iteration + 1,
+     }
+ 
+ 
+ def bob_node(state: AgentState) -> dict:
+     """Bob (Frontend) 节点：实现前端代码。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Bob executing iteration {iteration}")
+     
+     completion_check = _get_llm_with_structured("gpt-4o", DevCompletion)
+     prompt = create_bob_prompt()
+@@ -125,12 +137,15 @@
+     response = completion_check.invoke(messages)
+     
+     if response.is_complete:
++        logger.info(f"[task:{task_id}] Bob completed: {response.summary[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     
+     if response.needs_human:
++        logger.info(f"[task:{task_id}] Bob requesting human input")
+         return {"messages": [response], "active_agent": "human", "pending_human": True, "iteration_count": iteration + 1}
+     
++    logger.debug(f"[task:{task_id}] Bob continuing work")
+     return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
+ 
+ 
+@@ -139,7 +154,9 @@
+ def charlie_node(state: AgentState) -> dict:
+     """Charlie (Backend) 节点：实现后端代码。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Charlie executing iteration {iteration}")
+     
+     completion_check = _get_llm_with_structured("gpt-4o", DevCompletion)
+     prompt = create_charlie_prompt()
+@@ -151,12 +168,15 @@
+     response = completion_check.invoke(messages)
+     
+     if response.is_complete:
++        logger.info(f"[task:{task_id}] Charlie completed: {response.summary[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     
+     if response.needs_human:
++        logger.info(f"[task:{task_id}] Charlie requesting human input")
+         return {"messages": [response], "active_agent": "human", "pending_human": True, "iteration_count": iteration + 1}
+     
++    logger.debug(f"[task:{task_id}] Charlie continuing work")
+     return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
+ 
+ 
+@@ -165,7 +185,9 @@
+ def diana_node(state: AgentState) -> dict:
+     """Diana (QA) 节点：代码审查和验收。"""
+     messages = state["messages"]
++    task_id = state.get("task_id", "unknown")
+     iteration = state.get("iteration_count", 0)
++    logger.info(f"[task:{task_id}] Diana executing iteration {iteration}")
+     
+     qa_check = _get_llm_with_structured("gpt-4o", QARoutingDecision)
+     prompt = create_diana_prompt()
+@@ -178,17 +200,22 @@
+         decision: QARoutingDecision = qa_check.invoke(messages)
+     except Exception:
++        logger.error(f"[task:{task_id}] Diana routing parse failed, escalating to Alice")
+         # Fallback: escalate to Alice on parsing failure
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     
+     if decision.action == "reject_frontend":
++        logger.info(f"[task:{task_id}] Diana rejected frontend: {decision.reason[:100]}")
+         return {"messages": [response], "active_agent": "bob", "iteration_count": iteration + 1}
+     elif decision.action == "reject_backend":
++        logger.info(f"[task:{task_id}] Diana rejected backend: {decision.reason[:100]}")
+         return {"messages": [response], "active_agent": "charlie", "iteration_count": iteration + 1}
+     elif decision.action == "escalate":
++        logger.info(f"[task:{task_id}] Diana escalating: {decision.reason[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     elif decision.action == "approve":
++        logger.info(f"[task:{task_id}] Diana approved: {decision.reason[:100]}")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+     else:
++        logger.warning(f"[task:{task_id}] Diana unknown action '{decision.action}', escalating")
+         return {"messages": [response], "active_agent": "alice", "iteration_count": iteration + 1}
+ 
+ 
+@@ -196,8 +223,8 @@
+ def human_node(state: AgentState) -> dict:
+     """Human-in-the-Loop 节点：暂停工作流等待人类输入。"""
+-    print("\n" + "="*60)
+-    print("🛑 工作流暂停：等待人类输入")
+-    print("="*60)
++    task_id = state.get("task_id", "unknown")
++    logger.info(f"[task:{task_id}] Workflow paused awaiting human input")
++    print(f"\n{'='*60}\n🛑 工作流暂停：等待人类输入\n{'='*60}")
+     
+     last_message = state["messages"][-1] if state["messages"] else None
+     if last_message and hasattr(last_message, "content"):
+@@ -216,7 +243,8 @@
+         "messages": [human_msg],
+         "active_agent": "alice",
+         "pending_human": False,
+         "human_input": human_input,
+     }
++    logger.info(f"[task:{task_id}] Human input received: {human_input[:50]}")
++    return result
+ 
+ 
+ # ───────────────────────────────────────────────────────
+@@ -229,7 +257,7 @@
+     max_iter = state.get("max_iterations", 20)
+     
+     if iteration >= max_iter:
+-        print(f"⚠️ 达到最大迭代次数 {max_iter}，强制终止工作流。")
++        logger.warning(f"Max iterations ({max_iter}) reached, terminating workflow")
+         return "end"
+     
+     if state.get("pending_human"):

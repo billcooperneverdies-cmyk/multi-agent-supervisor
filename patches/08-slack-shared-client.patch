@@ -1,0 +1,126 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 08/10] HIGH: Shared HTTP client + deferred env for Slack
+
+Same issues as GitHub tools: import-time env var crash and no
+connection pooling. Apply the same fix pattern.
+
+--- mcp_server/tools/slack.py
++++ mcp_server/tools/slack.py
+@@ -6,14 +6,40 @@
+ import httpx
+ from pydantic import BaseModel, Field
+ 
++# ── Defer env var validation to runtime ──
+ SLACK_API_BASE = "https://slack.com/api"
+-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
+-if not SLACK_BOT_TOKEN:
+-    raise RuntimeError("SLACK_BOT_TOKEN environment variable is required.")
++SLACK_BOT_TOKEN: str | None = None
+ 
+-DEFAULT_HEADERS = {
+-    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+-    "Content-Type": "application/json; charset=utf-8",
+-}
++def _get_slack_token() -> str:
++    global SLACK_BOT_TOKEN
++    if SLACK_BOT_TOKEN is None:
++        SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
++        if not SLACK_BOT_TOKEN:
++            raise RuntimeError("SLACK_BOT_TOKEN environment variable is required.")
++    return SLACK_BOT_TOKEN
++
++def _get_headers() -> dict:
++    return {
++        "Authorization": f"Bearer {_get_slack_token()}",
++        "Content-Type": "application/json; charset=utf-8",
++    }
++
++# ── Shared HTTP client ──
++_SLACK_CLIENT: httpx.AsyncClient | None = None
++
++def get_slack_client() -> httpx.AsyncClient:
++    global _SLACK_CLIENT
++    if _SLACK_CLIENT is None or _SLACK_CLIENT.is_closed:
++        _SLACK_CLIENT = httpx.AsyncClient(
++            timeout=httpx.Timeout(15.0, connect=5.0),
++            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
++        )
++    return _SLACK_CLIENT
++
++async def close_slack_client():
++    global _SLACK_CLIENT
++    if _SLACK_CLIENT and not _SLACK_CLIENT.is_closed:
++        await _SLACK_CLIENT.aclose()
++        _SLACK_CLIENT = None
++
++# ── Slack API response wrapper ──
++async def _slack_request(method: str, url: str, json: dict | None = None, params: dict | None = None) -> dict:
++    """Make a Slack API request with error handling."""
++    client = get_slack_client()
++    headers = _get_headers()
++    resp = await client.request(method, url, headers=headers, json=json, params=params)
++    resp.raise_for_status()
++    data = resp.json()
++    if not data.get("ok"):
++        error = data.get("error", "unknown_error")
++        raise RuntimeError(f"Slack API error: {error}")
++    return data
+ 
+ 
+ class SendMessageInput(BaseModel):
+@@ -41,14 +67,8 @@
+     if params.thread_ts:
+         payload["thread_ts"] = params.thread_ts
+ 
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.post(url, headers=DEFAULT_HEADERS, json=payload)
+-        resp.raise_for_status()
+-        data = resp.json()
+-
+-    if not data.get("ok"):
+-        error_msg = data.get("error", "unknown_error")
+-        raise RuntimeError(f"Slack API returned error: {error_msg}")
++    client = get_slack_client()
++    data = await _slack_request("POST", url, json=payload)
+ 
+     return SendMessageOutput(
+         ok=data["ok"],
+@@ -73,14 +93,8 @@
+ 
+ async def slack_list_channels() -> ListChannelsOutput:
+     """List all public Slack channels in the workspace."""
+     url = f"{SLACK_API_BASE}/conversations.list"
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.get(url, headers=DEFAULT_HEADERS, params={"types": "public_channel"})
+-        resp.raise_for_status()
+-        data = resp.json()
+-
+-    if not data.get("ok"):
+-        error_msg = data.get("error", "unknown_error")
+-        raise RuntimeError(f"Slack API returned error: {error_msg}")
++    data = await _slack_request("GET", url, params={"types": "public_channel"})
+ 
+     channels = [
+         ChannelInfo(
+@@ -108,14 +122,8 @@
+ async def slack_get_channel_history(params: GetChannelHistoryInput) -> GetChannelHistoryOutput:
+     """Get recent messages from a Slack channel."""
+     url = f"{SLACK_API_BASE}/conversations.history"
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.get(
+-            url,
+-            headers=DEFAULT_HEADERS,
+-            params={"channel": params.channel, "limit": params.limit},
+-        )
+-        resp.raise_for_status()
+-        data = resp.json()
+-
+-    if not data.get("ok"):
+-        error_msg = data.get("error", "unknown_error")
+-        raise RuntimeError(f"Slack API returned error: {error_msg}")
++    data = await _slack_request(
++        "GET", url, params={"channel": params.channel, "limit": params.limit}
++    )
+ 
+     messages = [
+         MessageInfo(

@@ -1,0 +1,236 @@
+From: Principal Engineer <review@prod.harden>
+Subject: [PATCH 01/10] CRITICAL: Shared HTTP client with connection pooling
+
+Every function created a new AsyncClient, wasting TCP connections.
+Use a shared client with keep-alive and explicit timeouts.
+
+--- mcp_server/tools/github.py
++++ mcp_server/tools/github.py
+@@ -6,14 +6,79 @@
+ import httpx
+ from pydantic import BaseModel, Field
+ 
++# ── Defer env var validation to runtime (not import time) ──
+ GITHUB_API_BASE = "https://api.github.com"
+-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+-if not GITHUB_TOKEN:
+-    raise RuntimeError("GITHUB_TOKEN environment variable is required.")
++GITHUB_TOKEN: str | None = None
+ 
+-DEFAULT_HEADERS = {
+-    "Authorization": f"Bearer {GITHUB_TOKEN}",
+-    "Accept": "application/vnd.github+json",
+-    "X-GitHub-Api-Version": "2022-11-28",
+-}
++def _get_token() -> str:
++    global GITHUB_TOKEN
++    if GITHUB_TOKEN is None:
++        GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
++        if not GITHUB_TOKEN:
++            raise RuntimeError("GITHUB_TOKEN environment variable is required.")
++    return GITHUB_TOKEN
++
++def _get_headers() -> dict:
++    return {
++        "Authorization": f"Bearer {_get_token()}",
++        "Accept": "application/vnd.github+json",
++        "X-GitHub-Api-Version": "2022-11-28",
++    }
++
++# ── Shared HTTP client with connection pooling ──
++# 20 connections max, 30s timeout, HTTP/2 disabled for GitHub compatibility
++_GITHUB_CLIENT: httpx.AsyncClient | None = None
++
++def get_github_client() -> httpx.AsyncClient:
++    global _GITHUB_CLIENT
++    if _GITHUB_CLIENT is None or _GITHUB_CLIENT.is_closed:
++        _GITHUB_CLIENT = httpx.AsyncClient(
++            timeout=httpx.Timeout(30.0, connect=10.0),
++            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
++            http2=False,
++        )
++    return _GITHUB_CLIENT
++
++async def close_github_client():
++    global _GITHUB_CLIENT
++    if _GITHUB_CLIENT and not _GITHUB_CLIENT.is_closed:
++        await _GITHUB_CLIENT.aclose()
++        _GITHUB_CLIENT = None
++
++# ── Rate limit tracking ──
++_RATE_LIMIT_REMAINING: int = 5000
++_RATE_LIMIT_RESET: int = 0
++
++def _update_rate_limit(response: httpx.Response):
++    global _RATE_LIMIT_REMAINING, _RATE_LIMIT_RESET
++    _RATE_LIMIT_REMAINING = int(
++        response.headers.get("X-RateLimit-Remaining", _RATE_LIMIT_REMAINING)
++    )
++    _RATE_LIMIT_RESET = int(
++        response.headers.get("X-RateLimit-Reset", 0)
++    )
++
++def check_rate_limit() -> tuple[int, int]:
++    """Return (remaining_requests, reset_timestamp)."""
++    return _RATE_LIMIT_REMAINING, _RATE_LIMIT_RESET
++
++# ── Retry with exponential backoff ──
++async def _github_request(
++    method: str,
++    url: str,
++    json: dict | None = None,
++    params: dict | None = None,
++    max_retries: int = 3,
++) -> httpx.Response:
++    client = get_github_client()
++    headers = _get_headers()
++    last_error: Exception | None = None
++
++    for attempt in range(max_retries):
++        try:
++            if _RATE_LIMIT_REMAINING <= 1 and _RATE_LIMIT_RESET > 0:
++                import time, asyncio
++                sleep_time = max(0, _RATE_LIMIT_RESET - int(time.time()) + 1)
++                if sleep_time > 0:
++                    await asyncio.sleep(min(sleep_time, 60))
++
++            resp = await client.request(method, url, headers=headers, json=json, params=params)
++            _update_rate_limit(resp)
++
++            if resp.status_code == 429:
++                retry_after = int(resp.headers.get("Retry-After", 60))
++                await asyncio.sleep(min(retry_after, 60))
++                continue
++
++            if resp.status_code >= 500:
++                await asyncio.sleep(2 ** attempt)
++                continue
++
++            resp.raise_for_status()
++            return resp
++
++        except (httpx.TimeoutException, httpx.ConnectError) as e:
++            last_error = e
++            await asyncio.sleep(2 ** attempt)
++            continue
++
++    raise RuntimeError(f"GitHub API request failed after {max_retries} retries: {last_error}")
+ 
+ class CreatePRInput(BaseModel):
+     repo_owner: str = Field(..., description="Owner of the target repository")
+     repo_name: str = Field(..., description="Name of the target repository")
+@@ -41,11 +106,9 @@
+         "draft": params.draft,
+     }
+ 
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.post(url, headers=DEFAULT_HEADERS, json=payload)
+-        resp.raise_for_status()
+-        data = resp.json()
++    resp = await _github_request("POST", url, json=payload)
++    data = resp.json()
+ 
+     return CreatePROutput(
+         pr_url=data["html_url"],
+         pr_number=data["number"],
+         state=data["state"],
+@@ -65,18 +128,13 @@
+ async def github_create_branch(params: CreateBranchInput) -> CreateBranchOutput:
+     """Create a new branch from an existing branch."""
+     base_url = (
+-        f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}"
+-        f"/git/refs/heads/{params.from_branch}"
++        f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}/git/refs/heads/{params.from_branch}"
+     )
+-    async with httpx.AsyncClient() as client:
+-        base_resp = await client.get(base_url, headers=DEFAULT_HEADERS)
+-        base_resp.raise_for_status()
+-        base_sha = base_resp.json()["object"]["sha"]
++    base_resp = await _github_request("GET", base_url)
++    base_sha = base_resp.json()["object"]["sha"]
+ 
+-    create_url = (
+-        f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}/git/refs"
+-    )
++    create_url = f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}/git/refs"
+     payload = {"ref": f"refs/heads/{params.branch_name}", "sha": base_sha}
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.post(create_url, headers=DEFAULT_HEADERS, json=payload)
+-        resp.raise_for_status()
+-        data = resp.json()
++    resp = await _github_request("POST", create_url, json=payload)
++    data = resp.json()
+ 
+     return CreateBranchOutput(ref=data["ref"], sha=data["object"]["sha"], url=data["url"])
+@@ -99,11 +157,8 @@
+         f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}"
+         f"/contents/{params.file_path}"
+     )
+-    async with httpx.AsyncClient() as client:
+-        get_resp = await client.get(
+-            url, headers=DEFAULT_HEADERS, params={"ref": params.branch}
+-        )
+-        existing_sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
++    get_resp = await _github_request("GET", url, params={"ref": params.branch})
++    existing_sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+ 
+     payload = {
+         "message": params.message,
+@@ -113,11 +168,8 @@
+     if existing_sha:
+         payload["sha"] = existing_sha
+ 
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.put(url, headers=DEFAULT_HEADERS, json=payload)
+-        resp.raise_for_status()
+-        data = resp.json()
++    resp = await _github_request("PUT", url, json=payload)
++    data = resp.json()
+ 
+     return CommitFileOutput(
+         sha=data["content"]["sha"],
+         commit_url=data["commit"]["html_url"],
+@@ -138,10 +190,8 @@
+         f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}"
+         f"/contents/{params.file_path}"
+     )
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.get(url, headers=DEFAULT_HEADERS, params={"ref": params.branch})
+-        resp.raise_for_status()
+-        data = resp.json()
++    resp = await _github_request("GET", url, params={"ref": params.branch})
++    data = resp.json()
+ 
+     content = base64.b64decode(data["content"]).decode("utf-8")
+     return ReadFileOutput(content=content, sha=data["sha"], size=data["size"])
+@@ -170,12 +220,9 @@
+ async def github_list_commits(params: ListCommitsInput) -> ListCommitsOutput:
+     """List recent commits on a branch."""
+     url = f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}/commits"
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.get(
+-            url,
+-            headers=DEFAULT_HEADERS,
+-            params={"sha": params.branch, "per_page": params.per_page},
+-        )
+-        resp.raise_for_status()
+-        data = resp.json()
++    resp = await _github_request(
++        "GET", url, params={"sha": params.branch, "per_page": params.per_page}
++    )
++    data = resp.json()
+ 
+     commits = [
+         CommitInfo(
+@@ -207,9 +254,6 @@
+ async def github_create_issue(params: CreateIssueInput) -> CreateIssueOutput:
+     """Create a GitHub issue (e.g., for bug reports from QA)."""
+     url = f"{GITHUB_API_BASE}/repos/{params.repo_owner}/{params.repo_name}/issues"
+-    payload = { ... }
+-
+-    async with httpx.AsyncClient() as client:
+-        resp = await client.post(url, headers=DEFAULT_HEADERS, json=payload)
+-        resp.raise_for_status()
+-        data = resp.json()
++    resp = await _github_request("POST", url, json=payload)
++    data = resp.json()
