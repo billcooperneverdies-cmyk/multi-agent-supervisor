@@ -1,5 +1,13 @@
-# Dockerfile — MCP Server
-# Lightweight Python image for the MCP tool server
+# Dockerfile — MCP Server (standalone / dev use only)
+# Lightweight Python image for the MCP tool server.
+#
+# NOTE (BUG-025): this server speaks STDIO transport — it is designed to be
+# spawned as a subprocess by an MCP client (the agent service does this
+# in-process via MCP_SERVER_CMD; see docker-compose.yml). It is NOT a network
+# service: it exposes no ports and a detached container with closed stdin
+# will simply exit on EOF. Build/run it directly only for local debugging:
+#   docker build -f Dockerfile.mcp -t team-mcp .
+#   docker run --rm -i -e GITHUB_TOKEN -e SLACK_BOT_TOKEN team-mcp
 
 FROM python:3.12-slim-bookworm
 
