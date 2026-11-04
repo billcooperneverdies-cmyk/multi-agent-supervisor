@@ -11,12 +11,16 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      # REQUIRED, no default (BUG-006): postgres/postgres must never boot.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}
       POSTGRES_DB: ${POSTGRES_DB:-agent_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    # Port intentionally NOT published on the host (BUG-006): the database is
+    # reachable only on the internal agent-network. For local debugging,
+    # uncomment to bind on localhost only:
+    # ports:
+    #   - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agent_db}"]
       interval: 10s
@@ -36,15 +40,19 @@ services:
     ports:
       - "${LITELLM_PORT:-4000}:4000"
     environment:
-      # Master key for proxy authentication
-      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-master-key}
+      # Master key for proxy authentication — REQUIRED, no default (BUG-005)
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set (see .env.example)}
       # Store model config in database
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-agent_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-agent_db}
       # OpenAI (default)
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      # Slack / GitHub tokens passed through for tool calling
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Anthropic — required by the claude-3-5-sonnet entry in
+      # configs/litellm_proxy.yaml (os.environ/ANTHROPIC_API_KEY); previously
+      # referenced but never plumbed into this container (BUG-024).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # NOTE (BUG-021): GITHUB_TOKEN / SLACK_BOT_TOKEN are deliberately NOT
+      # passed to this container — the proxy never consumes them. They live
+      # only in the agent service, which spawns the MCP tool server.
     command: >
       --config /app/proxy_config.yaml
       --port 4000
@@ -62,22 +70,12 @@ services:
       retries: 3
 
   # ────────────────────────────────────────────────
-  # MCP Server (Middleware Component Protocol)
-  # Exposes GitHub & Slack tools via stdio/SSE
+  # MCP Server — NO standalone service (BUG-025)
+  # The MCP tool server speaks stdio, which cannot cross container boundaries:
+  # a sidecar container with closed stdin can never serve the agent. Instead,
+  # the AGENT service spawns it in-process via MCP_SERVER_CMD (see below).
+  # Dockerfile.mcp remains for standalone/dev use.
   # ────────────────────────────────────────────────
-  mcp-server:
-    build:
-      context: .
-      dockerfile: Dockerfile.mcp
-    container_name: agent-mcp
-    restart: unless-stopped
-    environment:
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
-    # stdio transport — used as a sidecar
-    # For SSE transport, expose: - "8001:8001"
-    networks:
-      - agent-network
 
   # ────────────────────────────────────────────────
   # Main Agent Service (LangGraph Supervisor)
@@ -89,16 +87,21 @@ services:
     container_name: agent-supervisor
     restart: unless-stopped
     ports:
-      - "${AGENT_PORT:-8000}:8000"
+      - "${AGENT_PORT:-8000}:${AGENT_PORT:-8000}"
     environment:
+      # In-container uvicorn/healthcheck port (matches the published port)
+      AGENT_PORT: ${AGENT_PORT:-8000}
       # LiteLLM Proxy endpoint
       LITELLM_API_BASE: http://litellm-proxy:4000
-      LITELLM_API_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-master-key}
-      # Postgres
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-agent_db}
-      # MCP Server (stdio pipe or SSE endpoint)
+      # Key the agent presents to the proxy — REQUIRED, no default (BUG-005)
+      LITELLM_API_KEY: ${LITELLM_API_KEY:?LITELLM_API_KEY must be set (see .env.example)}
+      # Postgres (LangGraph checkpointer)
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-agent_db}
+      # MCP tool server: spawned IN-PROCESS by the agent as a stdio
+      # subprocess (BUG-025); mcp_server/ is copied into this image.
       MCP_SERVER_CMD: python -m mcp_server.main
-      # Slack / GitHub (for direct API calls if needed)
+      # Slack / GitHub tokens — consumed by the spawned MCP tool server
+      # (inherited into its subprocess environment).
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     depends_on:
@@ -109,21 +112,12 @@ services:
     networks:
       - agent-network
 
-  # ────────────────────────────────────────────────
-  # Redis (Optional — for LangGraph checkpoint persistence)
-  # ────────────────────────────────────────────────
-  redis:
-    image: redis:7.4-alpine3.21
-    container_name: agent-redis
-    restart: unless-stopped
-    volumes:
-      - redis_data:/data
-    networks:
-      - agent-network
+  # NOTE (BUG-024): the redis service was removed — re-verified against current
+  # code, it has zero consumers (checkpointing uses DATABASE_URL/Postgres or
+  # in-memory; see orchestrator/state_machine.py get_checkpointer).
 
 volumes:
   postgres_data:
-  redis_data:
 
 networks:
   agent-network:
