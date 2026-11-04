@@ -7,6 +7,7 @@
 
 import os
 import re
+from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
@@ -18,13 +19,13 @@ SLACK_API_BASE = os.environ.get("SLACK_API_BASE", "https://slack.com/api")
 # BUG-042: cap the cursor loop at a sane number of pages.
 # BUG-043: per-process cache of channel name -> channel ID.
 MAX_LIST_PAGES = 10
-_channel_cache: dict = {}
+_channel_cache: dict[str, str] = {}
 
 # Slack conversation IDs: C... (channel), D... (DM), G... (group/private).
 _CHANNEL_ID_RE = re.compile(r"^[CDG][A-Z0-9]+$")
 
 
-def _headers() -> dict:
+def _headers() -> dict[str, str]:
     token = os.environ.get("SLACK_BOT_TOKEN")
     if not token:
         raise ToolError(
@@ -37,7 +38,7 @@ def _headers() -> dict:
     }
 
 
-def _check_ok(data: dict) -> dict:
+def _check_ok(data: dict[str, Any]) -> dict[str, Any]:
     """Slack returns HTTP 200 with ok:false for API-level errors."""
     if not isinstance(data, dict) or not data.get("ok"):
         error_msg = (data or {}).get("error", "unknown_error") if isinstance(data, dict) \
@@ -98,13 +99,13 @@ class ListChannelsOutput(BaseModel):
 
 
 async def _fetch_channel_pages(client: httpx.AsyncClient,
-                               max_pages: int = MAX_LIST_PAGES) -> list[dict]:
+                               max_pages: int = MAX_LIST_PAGES) -> list[dict[str, Any]]:
     """Follow conversations.list cursors (BUG-042), capped at ``max_pages``."""
     url = f"{SLACK_API_BASE}/conversations.list"
-    channels: list[dict] = []
+    channels: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(max_pages):
-        params: dict = {"types": "public_channel", "limit": 200}
+        params: dict[str, Any] = {"types": "public_channel", "limit": 200}
         if cursor:
             params["cursor"] = cursor
         resp = await client.get(url, headers=_headers(), params=params)
