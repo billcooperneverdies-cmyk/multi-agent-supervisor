@@ -29,7 +29,7 @@ class ToolError(Exception):
         self.code = code
         self.status = status
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Any]:
         return {"ok": False, "error": self.message, "code": self.code}
 
 
@@ -43,10 +43,10 @@ def _timeout_from_env() -> httpx.Timeout:
 HTTP_TIMEOUT = _timeout_from_env()
 
 
-def map_api_errors(service: str) -> Callable:
+def map_api_errors(service: str) -> Callable[..., Any]:
     """Decorator: normalize httpx/parse failures of an async tool into ToolError."""
 
-    def decorate(fn: Callable) -> Callable:
+    def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
         @functools.wraps(fn)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
