@@ -17,6 +17,7 @@ def client(install_model):
     from orchestrator.api import app
 
     with TestClient(app) as c:
+        c.headers["X-API-Key"] = "test-api-key"  # BUG-007: /tasks/* requires auth
         yield c
 
 
@@ -27,7 +28,7 @@ def _invoke(client) -> str:
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["status"] == "waiting_human", body
+    assert body["status"] == "awaiting_human", body  # BUG-017 status taxonomy
     return body["task_id"]
 
 
@@ -43,7 +44,7 @@ def test_status_reads_real_graph_state(client):
     resp = client.get(f"/tasks/{task_id}/status")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "waiting_human"
+    assert body["status"] == "awaiting_human"
     assert body["task_id"] == task_id
 
 

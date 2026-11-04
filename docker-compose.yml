@@ -91,6 +91,14 @@ services:
     environment:
       # In-container uvicorn/healthcheck port (matches the published port)
       AGENT_PORT: ${AGENT_PORT:-8000}
+      # BUG-045: the code default is loopback; container use opts into 0.0.0.0.
+      AGENT_HOST: 0.0.0.0
+      # API key for all /tasks/* endpoints (X-API-Key header) — REQUIRED, no
+      # default (BUG-007); the app refuses to start without it.
+      AGENT_API_KEY: ${AGENT_API_KEY:?AGENT_API_KEY must be set (see .env.example)}
+      # Task-run deadline / concurrency cap (BUG-016)
+      TASK_TIMEOUT_SECONDS: ${TASK_TIMEOUT_SECONDS:-300}
+      MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-4}
       # LiteLLM Proxy endpoint
       LITELLM_API_BASE: http://litellm-proxy:4000
       # Key the agent presents to the proxy — REQUIRED, no default (BUG-005)

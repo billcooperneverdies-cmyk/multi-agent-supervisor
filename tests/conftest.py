@@ -7,7 +7,7 @@ network access is used anywhere in these tests.
 
 import os
 import sys
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 from pydantic import Field
@@ -85,15 +85,26 @@ def install_model():
 
 @pytest.fixture(autouse=True)
 def _no_mcp_no_factory_leak(monkeypatch):
-    """Keep tests hermetic: no MCP spawn, no factory leak between tests."""
+    """Keep tests hermetic: no MCP spawn, no factory leak between tests.
+
+    Also provides a default AGENT_API_KEY (BUG-007): the API refuses to serve
+    without one, so tests that exercise auth explicitly override/delete it.
+    """
     monkeypatch.delenv("MCP_SERVER_CMD", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("AGENT_API_KEY", "test-api-key")
     yield
     try:
         from orchestrator import state_machine as sm
 
         sm.reset_llm_factory()
         sm.reset_mcp_tools()
+    except Exception:
+        pass
+    try:
+        from orchestrator import api as api_mod
+
+        api_mod.in_flight.draining = False
     except Exception:
         pass
 

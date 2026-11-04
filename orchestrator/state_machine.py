@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 HISTORY_WINDOW_ENV = "HISTORY_WINDOW"
 DEFAULT_HISTORY_WINDOW = 20
 
+# BUG-023: bounded resilience at the LiteLLM boundary (factory parameters).
+LLM_REQUEST_TIMEOUT_ENV = "LLM_REQUEST_TIMEOUT"
+DEFAULT_LLM_REQUEST_TIMEOUT = 60  # seconds per LLM HTTP request
+LLM_MAX_RETRIES_ENV = "LLM_MAX_RETRIES"
+DEFAULT_LLM_MAX_RETRIES = 2
+
 VALID_AGENTS = ("alice", "bob", "charlie", "diana", "human", "end")
 
 
@@ -94,13 +100,33 @@ def reset_llm_factory() -> None:
 
 
 @lru_cache(maxsize=8)
-def _cached_llm(model: str, base_url: str, api_key: str) -> ChatOpenAI:
+def _cached_llm(
+    model: str, base_url: str, api_key: str, timeout: float, max_retries: int
+) -> ChatOpenAI:
     return ChatOpenAI(
         model=model,
         api_key=SecretStr(api_key),
         base_url=base_url,
         temperature=0.2,
+        # BUG-023: explicit request timeout + bounded retries instead of the
+        # open-ended client defaults that hung/never-retried node calls.
+        timeout=timeout,
+        max_retries=max_retries,
     )
+
+
+def _llm_request_timeout() -> float:
+    try:
+        return float(os.environ.get(LLM_REQUEST_TIMEOUT_ENV, DEFAULT_LLM_REQUEST_TIMEOUT))
+    except ValueError:
+        return float(DEFAULT_LLM_REQUEST_TIMEOUT)
+
+
+def _llm_max_retries() -> int:
+    try:
+        return max(0, int(os.environ.get(LLM_MAX_RETRIES_ENV, DEFAULT_LLM_MAX_RETRIES)))
+    except ValueError:
+        return DEFAULT_LLM_MAX_RETRIES
 
 
 def reset_llm_caches() -> None:
@@ -126,7 +152,7 @@ def get_llm(model: str = "gpt-4o") -> BaseChatModel:
             "(LITELLM_MASTER_KEY) or a proxy virtual key; see .env.example. "
             "No default credential is provided."
         )
-    return _cached_llm(model, base_url, api_key)
+    return _cached_llm(model, base_url, api_key, _llm_request_timeout(), _llm_max_retries())
 
 
 # ───────────────────────────────────────────────────────
