@@ -15,16 +15,17 @@ import logging
 import operator
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
 from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
     HumanMessage,
 )
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -200,7 +201,7 @@ def parse_sentinels(text: str) -> list[tuple[str, str]]:
     return tokens
 
 
-def alice_route(content: str, state: dict) -> str:
+def alice_route(content: str, state: Mapping[str, Any]) -> str:
     """Alice routing decision from normalized content.
 
     Termination tokens are evaluated BEFORE agent-name tokens (BUG-012);
@@ -258,10 +259,10 @@ def diana_route(content: str) -> str:
 # ───────────────────────────────────────────────────────
 # MCP 工具加载 (BUG-014) — lazy, graceful degradation
 # ───────────────────────────────────────────────────────
-_MCP_TOOLS: "list | None" = None
+_MCP_TOOLS: "list[Any] | None" = None
 
 
-async def get_mcp_tools() -> list:
+async def get_mcp_tools() -> list[Any]:
     """Load MCP tools over a spawned stdio server (MCP_SERVER_CMD).
 
     Graceful degradation: MCP_SERVER_CMD unset, the adapters package missing,
@@ -318,14 +319,14 @@ def extract_result_urls(text: str) -> tuple[list[str], list[str]]:
 
 
 async def _execute_tool_calls(
-    response: BaseMessage, tools: list
-) -> tuple[list, list[dict], list[str], list[str]]:
+    response: BaseMessage, tools: list[Any]
+) -> tuple[list[Any], list[dict[str, Any]], list[str], list[str]]:
     """Execute the LLM's tool calls; collect ToolMessages, results and URLs."""
     from langchain_core.messages import ToolMessage
 
     tools_by_name = {getattr(t, "name", ""): t for t in tools}
-    tool_messages: list = []
-    results: list[dict] = []
+    tool_messages: list[Any] = []
+    results: list[dict[str, Any]] = []
     pr_urls: list[str] = []
     issue_urls: list[str] = []
     for call in getattr(response, "tool_calls", None) or []:
@@ -374,7 +375,7 @@ def window_history(messages: list[BaseMessage], window: int | None = None) -> li
 # 运行配置 (BUG-030)
 # ───────────────────────────────────────────────────────
 
-def make_run_config(task_id: str, max_iterations: int) -> dict:
+def make_run_config(task_id: str, max_iterations: int) -> RunnableConfig:
     """Explicit recursion_limit coherent with max_iterations (BUG-030) and a
     checkpointer thread_id (BUG-010)."""
     return {
@@ -422,7 +423,7 @@ def new_task_state(
 
 async def _invoke_agent(
     state: AgentState, prompt_factory: Callable[[], Any]
-) -> tuple[BaseMessage, dict]:
+) -> tuple[BaseMessage, dict[str, Any]]:
     """Run one agent LLM call: persona prompt + windowed history + ainvoke.
 
     Binds real MCP tools when available (BUG-014); executes any tool calls for
@@ -431,13 +432,14 @@ async def _invoke_agent(
     """
     llm: BaseChatModel = get_llm()
     tools = await get_mcp_tools()
-    if tools:
-        llm = llm.bind_tools(tools)
-    chain = prompt_factory() | llm
+    model: Runnable[LanguageModelInput, BaseMessage] = (
+        llm.bind_tools(tools) if tools else llm
+    )
+    chain = prompt_factory() | model
     history = window_history(list(state["messages"]))
     response = await chain.ainvoke({"messages": history})
 
-    out_messages: list = [response]
+    out_messages: list[BaseMessage] = [response]
     extra: dict[str, Any] = {
         "messages": out_messages,
         "tool_calls": None,
@@ -458,7 +460,7 @@ async def _invoke_agent(
     return response, extra
 
 
-async def alice_node(state: AgentState) -> dict:
+async def alice_node(state: AgentState) -> dict[str, Any]:
     """Alice (PM) 节点：需求分析、任务分解、路由决策。"""
     response, extra = await _invoke_agent(state, create_alice_prompt)
     next_agent = alice_route(normalize_content(response.content), state)
@@ -476,7 +478,7 @@ def _branch_name(kind: str, state: AgentState) -> str:
     return f"{kind}/{state.get('task_id') or 'local'}"
 
 
-async def bob_node(state: AgentState) -> dict:
+async def bob_node(state: AgentState) -> dict[str, Any]:
     """Bob (Frontend) 节点：实现前端代码并记录 frontend_branch (BUG-032)。"""
     response, extra = await _invoke_agent(state, create_bob_prompt)
     next_agent = worker_route(normalize_content(response.content))
@@ -491,7 +493,7 @@ async def bob_node(state: AgentState) -> dict:
     return update
 
 
-async def charlie_node(state: AgentState) -> dict:
+async def charlie_node(state: AgentState) -> dict[str, Any]:
     """Charlie (Backend) 节点：实现后端代码并记录 backend_branch (BUG-032)。"""
     response, extra = await _invoke_agent(state, create_charlie_prompt)
     next_agent = worker_route(normalize_content(response.content))
@@ -506,7 +508,7 @@ async def charlie_node(state: AgentState) -> dict:
     return update
 
 
-async def diana_node(state: AgentState) -> dict:
+async def diana_node(state: AgentState) -> dict[str, Any]:
     """Diana (QA) 节点：代码审查和验收。"""
     response, extra = await _invoke_agent(state, create_diana_prompt)
     route = diana_route(normalize_content(response.content))
@@ -521,7 +523,7 @@ async def diana_node(state: AgentState) -> dict:
     return update
 
 
-async def human_node(state: AgentState) -> dict:
+async def human_node(state: AgentState) -> dict[str, Any]:
     """Human-in-the-Loop 节点：interrupt() 暂停，Command(resume=...) 恢复 (BUG-008/010)。
 
     No stdin/stdout blocking here: the pause is persisted by the checkpointer
@@ -599,7 +601,7 @@ def get_checkpointer() -> Any:
 # 图构建
 # ───────────────────────────────────────────────────────
 
-def build_team_workflow(checkpointer: Any = None) -> CompiledStateGraph:
+def build_team_workflow(checkpointer: Any = None) -> CompiledStateGraph[AgentState]:
     """
     构建四代理协作工作流图。
 
