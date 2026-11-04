@@ -3,8 +3,6 @@ survivable, exit codes are sane. No tracebacks, no restart loops."""
 
 import asyncio
 
-import pytest
-
 
 def test_cli_eof_exits_cleanly(monkeypatch, capsys):
     """Closed stdin (Ctrl-D / container) -> clean message + exit code 0."""
@@ -28,11 +26,11 @@ def test_cli_exit_command(monkeypatch):
 def test_cli_task_error_does_not_kill_session(monkeypatch, capsys, install_model):
     """A failing run is reported and the loop continues; EOF then exits 0."""
 
-    class Boom(Exception):
+    class BoomError(Exception):
         pass
 
     async def boom(*args, **kwargs):
-        raise Boom("litellm proxy unreachable")
+        raise BoomError("litellm proxy unreachable")
 
     monkeypatch.setattr("orchestrator.agent.run_team", boom)
     inputs = iter(["do something"])

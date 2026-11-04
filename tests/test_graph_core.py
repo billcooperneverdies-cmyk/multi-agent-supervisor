@@ -9,11 +9,10 @@ import importlib
 import sys
 
 import pytest
+from conftest import initial_state
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
-
-from conftest import initial_state
 
 
 def run(coro):
@@ -226,8 +225,14 @@ def test_alice_fallback_uses_branch_state():
     """BUG-032: with frontend done and backend missing, fallback routes to charlie."""
     from orchestrator.state_machine import alice_route
 
-    assert alice_route("no sentinel here", {"frontend_branch": "f", "backend_branch": None}) == "charlie"
-    assert alice_route("no sentinel here", {"frontend_branch": None, "backend_branch": "b"}) == "bob"
+    assert (
+        alice_route("no sentinel here", {"frontend_branch": "f", "backend_branch": None})
+        == "charlie"
+    )
+    assert (
+        alice_route("no sentinel here", {"frontend_branch": None, "backend_branch": "b"})
+        == "bob"
+    )
 
 
 # ───────────────────────────────────────────────────────
@@ -269,7 +274,11 @@ def test_history_window_bounds_prompt(install_model, monkeypatch):
         HumanMessage(content=f"noise-{i}") for i in range(40)
     ]
     graph = build_graph()
-    run(graph.ainvoke(initial_state(messages=history), config={"configurable": {"thread_id": "h1"}}))
+    run(
+        graph.ainvoke(
+            initial_state(messages=history), config={"configurable": {"thread_id": "h1"}}
+        )
+    )
     outbound = model.received[0]
     contents = [str(m.content) for m in outbound]
     assert any("TASK-ROOT" in c for c in contents), "first task message must be kept"

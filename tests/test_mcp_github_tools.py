@@ -12,8 +12,8 @@ import httpx
 import pytest
 import respx
 
-from mcp_server.tools.errors import ToolError
 from mcp_server.tools import github as gh
+from mcp_server.tools.errors import ToolError
 
 
 def run(coro):
