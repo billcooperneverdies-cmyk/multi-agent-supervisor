@@ -78,7 +78,7 @@ def _repo_base(owner: str, name: str) -> str:
     return f"{GITHUB_API_BASE}/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
 
 
-def _headers() -> dict:
+def _headers() -> dict[str, str]:
     """Build auth headers at call time; structured error if unconfigured."""
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
