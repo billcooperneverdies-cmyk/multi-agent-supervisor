@@ -234,22 +234,28 @@ def test_alice_fallback_uses_branch_state():
 # BUG-033 / BUG-034: SecretStr + cached LLM client
 # ───────────────────────────────────────────────────────
 
-def test_get_llm_caches_singleton_per_config():
+def test_get_llm_caches_singleton_per_config(monkeypatch):
     from orchestrator.state_machine import get_llm, reset_llm_caches
 
+    # BUG-005: LITELLM_API_KEY is now required (no hardcoded default).
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test-dummy-key")
     reset_llm_caches()
     llm1 = get_llm()
     llm2 = get_llm()
     assert llm1 is llm2, "get_llm must cache one client per config"
+    reset_llm_caches()
 
 
-def test_get_llm_api_key_is_secretstr():
+def test_get_llm_api_key_is_secretstr(monkeypatch):
     from pydantic import SecretStr
 
     from orchestrator.state_machine import get_llm, reset_llm_caches
 
+    # BUG-005: LITELLM_API_KEY is now required (no hardcoded default).
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test-dummy-key")
     reset_llm_caches()
     assert isinstance(get_llm().openai_api_key, SecretStr)
+    reset_llm_caches()
 
 
 # ───────────────────────────────────────────────────────
