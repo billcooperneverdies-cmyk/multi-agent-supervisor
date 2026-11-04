@@ -1,147 +1,284 @@
-"""Deployment contract tests: BUG-005/006/009/021/022/024/025.
+"""Deploy-config & secrets-hygiene tests.
 
-Assert the docker/compose/env invariants that previously shipped footguns:
+Covers BUG-005 (hardcoded LiteLLM key), BUG-006 (default postgres creds /
+published 5432), BUG-009 (agent image runs the API, not the CLI), BUG-021
+(token sprawl into litellm-proxy), BUG-022 (.env.example completeness),
+BUG-024 (dead services/vars) and BUG-025 (MCP stdio sidecar -> in-process
+spawn by the agent service).
 
-- BUG-005/006: required secrets use :? (hard fail, no default anywhere) and
-  are absent as defaults in code/compose/env-template.
-- BUG-009: Dockerfile.agent default CMD serves the FastAPI app the
-  healthcheck probes; CLI available explicitly.
-- BUG-021: GITHUB_TOKEN/SLACK_BOT_TOKEN are not plumbed into litellm-proxy.
-- BUG-022: the agent image actually contains mcp_server/ AND agents/.
-- BUG-024: the dead redis service is gone.
-- BUG-025: no standalone mcp-server service in compose; stdio transport is
-  in-process via MCP_SERVER_CMD.
+Everything here is static (repo-file) analysis plus a small code-level
+fail-fast check — no docker daemon required. The compose file is parsed with
+PyYAML (docker is unavailable in CI/dev containers).
 """
 
-import os
 import re
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import pytest
+import yaml
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+COMPOSE_PATH = REPO_ROOT / "docker-compose.yml"
+ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
+DOCKERFILE_AGENT_PATH = REPO_ROOT / "Dockerfile.agent"
+DOCKERFILE_MCP_PATH = REPO_ROOT / "Dockerfile.mcp"
+LITELLM_CONFIG_PATH = REPO_ROOT / "configs" / "litellm_proxy.yaml"
 
-def _read(path):
-    with open(os.path.join(REPO_ROOT, path)) as fh:
-        return fh.read()
+CODE_DIRS = ("orchestrator", "mcp_server", "agents")
 
+# Built by concatenation so this test file itself never contains the literal.
+HARD_CODED_KEY = "sk-litellm-" + "master-key"
 
-COMPOSE = _read("docker-compose.yml")
-DOCKERFILE_AGENT = _read("Dockerfile.agent")
-DOCKERFILE_MCP = _read("Dockerfile.mcp")
-ENV_EXAMPLE = _read(".env.example")
-STATE_MACHINE = _read("orchestrator/state_machine.py")
-
-
-def _service_block(compose: str, name: str) -> str:
-    """Extract the YAML block of a compose service (indentation-based)."""
-    pattern = re.compile(rf"^  {name}:\n((?:    .*\n|\s*\n)*)", re.MULTILINE)
-    match = pattern.search(compose)
-    assert match, f"service {name!r} not found in docker-compose.yml"
-    return match.group(1)
-
-
-# ── BUG-005: LITELLM_MASTER_KEY / LITELLM_API_KEY required, no defaults ──
+COMPOSE_TEXT = COMPOSE_PATH.read_text(encoding="utf-8")
+COMPOSE = yaml.safe_load(COMPOSE_TEXT)
+ENV_EXAMPLE_TEXT = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+DOCKERFILE_AGENT = DOCKERFILE_AGENT_PATH.read_text(encoding="utf-8")
+DOCKERFILE_MCP = DOCKERFILE_MCP_PATH.read_text(encoding="utf-8")
 
 
-def test_litellm_master_key_required_no_default():
-    assert "${LITELLM_MASTER_KEY:?" in COMPOSE
-    assert "sk-litellm-master-key" not in COMPOSE
+# ──────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────
+
+def _service_env(compose: dict, service: str) -> dict:
+    """Return a service's environment as a dict (handles list or mapping form)."""
+    env = compose["services"][service].get("environment") or {}
+    if isinstance(env, dict):
+        return dict(env)
+    out = {}
+    for item in env:
+        key, _, value = item.partition("=")
+        out[key] = value
+    return out
 
 
-def test_litellm_api_key_required_no_default():
-    assert "${LITELLM_API_KEY:?" in COMPOSE
-    assert "sk-litellm-master-key" not in STATE_MACHINE
-    assert "sk-litellm-master-key" not in ENV_EXAMPLE
+def _uncommented_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
 
 
-def test_get_llm_fails_fast_without_api_key():
-    """The code must refuse to build an LLM client with no key configured."""
-    import os as _os
+def _code_env_vars() -> set[str]:
+    """Every env var read via os.environ/os.getenv in shipping code."""
+    keys: set[str] = set()
+    literal = re.compile(r"""os\.(?:environ\.get|getenv)\(\s*['"]([A-Z][A-Z0-9_]*)['"]""")
+    subscript = re.compile(r"""os\.environ\[\s*['"]([A-Z][A-Z0-9_]*)['"]\s*\]""")
+    indirect_call = re.compile(r"""os\.(?:environ\.get|getenv)\(\s*([A-Z][A-Z0-9_]*)\s*[,)]""")
+    constant = re.compile(r"""^([A-Z][A-Z0-9_]*)\s*=\s*['"]([A-Z][A-Z0-9_]*)['"]""", re.M)
+    for dirname in CODE_DIRS:
+        for path in (REPO_ROOT / dirname).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            keys.update(literal.findall(text))
+            keys.update(subscript.findall(text))
+            constants = dict(constant.findall(text))
+            for name in indirect_call.findall(text):
+                if name in constants:  # e.g. os.environ.get(HISTORY_WINDOW_ENV, ...)
+                    keys.add(constants[name])
+    return keys
 
-    _os.environ.pop("LITELLM_API_KEY", None)
+
+def _compose_interpolated_vars() -> set[str]:
+    pattern = re.compile(r"\$\{([A-Z][A-Z0-9_]*)[^}]*\}")
+    keys: set[str] = set()
+    for line in _uncommented_lines(COMPOSE_TEXT):
+        keys.update(pattern.findall(line))
+    return keys
+
+
+def _litellm_config_env_vars() -> set[str]:
+    text = LITELLM_CONFIG_PATH.read_text(encoding="utf-8")
+    return set(re.findall(r"os\.environ/([A-Z][A-Z0-9_]*)", text))
+
+
+def _dockerfile_env_vars() -> set[str]:
+    keys: set[str] = set()
+    for text in (DOCKERFILE_AGENT, DOCKERFILE_MCP):
+        for line in _uncommented_lines(text):
+            keys.update(re.findall(r"\$\{?([A-Z][A-Z0-9_]*)\}?", line))
+            keys.update(re.findall(r"^\s*(?:ENV|ARG)\s+([A-Z][A-Z0-9_]*)", line))
+    return keys
+
+
+def _env_example_documented_vars() -> set[str]:
+    keys: set[str] = set()
+    for line in ENV_EXAMPLE_TEXT.splitlines():
+        match = re.match(r"^([A-Z][A-Z0-9_]*)=", line)
+        if match:
+            keys.add(match.group(1))
+    return keys
+
+
+def _all_consumed_vars() -> set[str]:
+    return (
+        _code_env_vars()
+        | _compose_interpolated_vars()
+        | _litellm_config_env_vars()
+        | _dockerfile_env_vars()
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# BUG-005 — no hardcoded LiteLLM key; fail fast without LITELLM_API_KEY
+# ──────────────────────────────────────────────────────────────
+
+def test_no_hardcoded_litellm_key_anywhere():
+    offenders = []
+    for path in REPO_ROOT.rglob("*"):
+        if not path.is_file() or path.suffix in {".pyc", ".pyo"}:
+            continue
+        if any(part in {".git", "__pycache__", ".pytest_cache"} for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if HARD_CODED_KEY in text:
+            offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert offenders == [], f"hardcoded LiteLLM key found in: {offenders}"
+
+
+def test_compose_requires_litellm_keys():
+    assert "${LITELLM_MASTER_KEY:?" in COMPOSE_TEXT, (
+        "litellm-proxy must require LITELLM_MASTER_KEY (no default)"
+    )
+    assert "${LITELLM_API_KEY:?" in COMPOSE_TEXT, (
+        "agent service must require LITELLM_API_KEY (no default)"
+    )
+    assert ":-sk-" not in COMPOSE_TEXT, "compose still defaults some key to a sk- literal"
+
+
+def test_get_llm_fails_fast_without_litellm_api_key(monkeypatch):
     from orchestrator import state_machine as sm
 
     sm.reset_llm_factory()
     sm.reset_llm_caches()
-    try:
-        try:
-            sm.get_llm()
-        except RuntimeError as exc:
-            assert "LITELLM_API_KEY" in str(exc)
-        else:
-            raise AssertionError("get_llm() without LITELLM_API_KEY must fail fast")
-    finally:
-        sm.reset_llm_caches()
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="LITELLM_API_KEY"):
+        sm.get_llm()
 
 
-# ── BUG-006: POSTGRES_PASSWORD required; db not host-published ───────────
+def test_get_llm_builds_with_litellm_api_key(monkeypatch):
+    from langchain_openai import ChatOpenAI
+
+    from orchestrator import state_machine as sm
+
+    sm.reset_llm_factory()
+    sm.reset_llm_caches()
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test-dummy-key")
+    llm = sm.get_llm()
+    assert isinstance(llm, ChatOpenAI)
+    sm.reset_llm_caches()
 
 
-def test_postgres_password_required_no_default():
-    assert "${POSTGRES_PASSWORD:?" in COMPOSE
-    assert "POSTGRES_PASSWORD:-postgres" not in COMPOSE
+# ──────────────────────────────────────────────────────────────
+# BUG-006 — postgres: required password, no host port
+# ──────────────────────────────────────────────────────────────
+
+def test_postgres_password_has_no_default():
+    assert "${POSTGRES_PASSWORD:?" in COMPOSE_TEXT, (
+        "POSTGRES_PASSWORD must use required-var interpolation"
+    )
+    assert "POSTGRES_PASSWORD:-" not in COMPOSE_TEXT, (
+        "POSTGRES_PASSWORD still has a default value"
+    )
 
 
-def test_postgres_port_not_published_on_host():
-    postgres = _service_block(COMPOSE, "postgres")
-    assert re.search(r"^\s+ports:", postgres, re.MULTILINE) is None
+def test_postgres_port_not_published():
+    postgres = COMPOSE["services"]["postgres"]
+    assert "ports" not in postgres, "postgres must not publish 5432 on the host"
 
 
-# ── BUG-009: agent Dockerfile CMD/healthcheck coherence ──────────────────
+# ──────────────────────────────────────────────────────────────
+# BUG-009 — Dockerfile.agent serves the API; copies all packages
+# ──────────────────────────────────────────────────────────────
+
+def _dockerfile_cmd(text: str) -> str:
+    """The image's default CMD (last CMD instruction; earlier ones may be part
+    of a HEALTHCHECK clause)."""
+    cmd_lines = [
+        line for line in text.splitlines() if line.strip().upper().startswith("CMD ")
+    ]
+    return cmd_lines[-1] if cmd_lines else ""
 
 
-def test_agent_dockerfile_cmd_serves_api_and_healthcheck_matches():
-    assert "uvicorn orchestrator.api:app" in DOCKERFILE_AGENT
-    assert "/health" in DOCKERFILE_AGENT
-    assert 'CMD ["python", "-m", "orchestrator.agent"]' not in DOCKERFILE_AGENT
+def test_dockerfile_agent_copies_all_packages():
+    for pkg in ("orchestrator", "agents", "mcp_server"):
+        assert re.search(rf"^COPY {pkg}/ \./{pkg}/", DOCKERFILE_AGENT, re.M), (
+            f"Dockerfile.agent must COPY {pkg}/"
+        )
 
 
-def test_agent_dockerfile_documents_cli_entry():
-    assert "python -m orchestrator.agent" in DOCKERFILE_AGENT
+def test_dockerfile_agent_cmd_serves_api_not_cli():
+    cmd = _dockerfile_cmd(DOCKERFILE_AGENT)
+    assert cmd, "Dockerfile.agent has no CMD"
+    assert "orchestrator.api" in cmd, "default CMD must serve the FastAPI app"
+    assert "uvicorn" in cmd.lower(), "default CMD must run uvicorn"
+    assert "orchestrator.agent" not in cmd, "interactive CLI must not be the default CMD"
+    assert "AGENT_PORT" in cmd, "CMD must honor AGENT_PORT"
 
 
-# ── BUG-021: tool tokens not plumbed into the litellm proxy ──────────────
+def test_dockerfile_agent_healthcheck_matches_api():
+    match = re.search(r"HEALTHCHECK.*?CMD\s+(.*)", DOCKERFILE_AGENT, re.S)
+    assert match, "Dockerfile.agent has no HEALTHCHECK"
+    check = match.group(1)
+    assert "/health" in check
+    assert "AGENT_PORT" in check, "healthcheck must target the AGENT_PORT"
 
 
-def test_tool_tokens_absent_from_litellm_proxy_service():
-    proxy = _service_block(COMPOSE, "litellm-proxy")
-    assert "GITHUB_TOKEN" not in proxy
-    assert "SLACK_BOT_TOKEN" not in proxy
+# ──────────────────────────────────────────────────────────────
+# BUG-021 / BUG-025 — least-privilege env; MCP spawned by the agent
+# ──────────────────────────────────────────────────────────────
+
+def test_litellm_proxy_has_no_github_or_slack_tokens():
+    env = _service_env(COMPOSE, "litellm-proxy")
+    assert "GITHUB_TOKEN" not in env, "GITHUB_TOKEN must not reach the litellm container"
+    assert "SLACK_BOT_TOKEN" not in env, "SLACK_BOT_TOKEN must not reach the litellm container"
 
 
-def test_tool_tokens_present_in_agent_service():
-    agent = _service_block(COMPOSE, "agent")
-    assert "GITHUB_TOKEN" in agent
-    assert "SLACK_BOT_TOKEN" in agent
+def test_agent_service_spawns_mcp_and_holds_tokens():
+    services = COMPOSE["services"]
+    assert "mcp-server" not in services, (
+        "standalone mcp-server sidecar must be removed (agent spawns stdio MCP in-process)"
+    )
+    env = _service_env(COMPOSE, "agent")
+    assert env.get("MCP_SERVER_CMD") == "python -m mcp_server.main"
+    assert "GITHUB_TOKEN" in env, "agent container needs GITHUB_TOKEN for spawned MCP"
+    assert "SLACK_BOT_TOKEN" in env, "agent container needs SLACK_BOT_TOKEN for spawned MCP"
 
 
-# ── BUG-022: agent image contains mcp_server and agents ──────────────────
+def test_dockerfile_mcp_documents_stdio_transport():
+    assert "stdio" in DOCKERFILE_MCP.lower(), (
+        "Dockerfile.mcp must document its standalone stdio/dev nature"
+    )
 
 
-def test_agent_dockerfile_copies_mcp_server_and_agents():
-    assert "COPY mcp_server/" in DOCKERFILE_AGENT
-    assert "COPY agents/" in DOCKERFILE_AGENT
-    assert "COPY orchestrator/" in DOCKERFILE_AGENT
+# ──────────────────────────────────────────────────────────────
+# BUG-024 — dead services removed
+# ──────────────────────────────────────────────────────────────
+
+def test_no_redis_service():
+    assert "redis" not in COMPOSE["services"], "redis has zero consumers; service must go"
+    volumes = COMPOSE.get("volumes") or {}
+    assert "redis_data" not in volumes
 
 
-# ── BUG-024: dead redis service removed ──────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+# BUG-022 — .env.example documents every consumed var, no phantoms
+# ──────────────────────────────────────────────────────────────
+
+def test_env_example_documents_every_consumed_var():
+    consumed = _all_consumed_vars()
+    documented = _env_example_documented_vars()
+    missing = consumed - documented
+    assert not missing, f"consumed but undocumented in .env.example: {sorted(missing)}"
 
 
-def test_no_redis_service_anywhere():
-    assert "redis" not in COMPOSE.lower()
+def test_env_example_has_no_phantom_vars():
+    consumed = _all_consumed_vars()
+    documented = _env_example_documented_vars()
+    phantom = documented - consumed
+    assert not phantom, f"documented in .env.example but nothing consumes: {sorted(phantom)}"
 
 
-# ── BUG-025: no standalone mcp-server service; stdio stays in-process ────
-
-
-def test_no_standalone_mcp_server_service_in_compose():
-    assert re.search(r"^  mcp-server:", COMPOSE, re.MULTILINE) is None
-    assert "Dockerfile.mcp" not in COMPOSE
-
-
-def test_agent_sets_mcp_server_cmd():
-    agent = _service_block(COMPOSE, "agent")
-    assert "MCP_SERVER_CMD" in agent
-
-
-def test_mcp_dockerfile_documents_stdio_only():
-    assert "stdio" in DOCKERFILE_MCP
+def test_env_example_sanity_required_secrets_present():
+    documented = _env_example_documented_vars()
+    for var in ("LITELLM_MASTER_KEY", "LITELLM_API_KEY", "POSTGRES_PASSWORD"):
+        assert var in documented
