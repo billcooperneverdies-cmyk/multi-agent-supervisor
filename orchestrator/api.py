@@ -5,13 +5,14 @@ import hmac
 import logging
 import os
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from langgraph.types import Command
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command, StateSnapshot
 from pydantic import BaseModel, Field
 
 from orchestrator import __version__
@@ -62,7 +63,7 @@ async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期管理。Fail-fast without AGENT_API_KEY (BUG-007)."""
     if not configured_api_key():
         raise RuntimeError(
@@ -126,7 +127,7 @@ class TeamTaskResponse(BaseModel):
     status: str
     active_agent: str
     iteration_count: int
-    messages: list[dict]
+    messages: list[dict[str, Any]]
     pr_urls: list[str]
     issue_urls: list[str]
     summary: str | None
@@ -168,7 +169,9 @@ def _upstream_error_type(exc: BaseException) -> str | None:
     return None
 
 
-async def _call_graph(run: Any, task_id: str) -> dict[str, Any]:
+async def _call_graph(
+    run: Callable[[], Awaitable[dict[str, Any]]], task_id: str
+) -> dict[str, Any]:
     """Run one graph invocation, mapping LLM/proxy failures to structured 502
     (BUG-023); anything else bubbles to the generic 500 handler (BUG-039)."""
     try:
@@ -221,14 +224,14 @@ class InFlightRegistry:
     """Tracks in-flight graph-run tasks (BUG-016 cap, BUG-037 drain)."""
 
     def __init__(self) -> None:
-        self._tasks: set[asyncio.Task] = set()
+        self._tasks: set[asyncio.Task[Any]] = set()
         self.draining = False
 
     @property
     def count(self) -> int:
         return len(self._tasks)
 
-    def register(self, task: asyncio.Task) -> None:
+    def register(self, task: asyncio.Task[Any]) -> None:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -295,11 +298,11 @@ def resolve_serve_settings() -> tuple[str, int]:
     return host, port
 
 
-def _thread_config(task_id: str) -> dict:
+def _thread_config(task_id: str) -> RunnableConfig:
     return {"configurable": {"thread_id": task_id}}
 
 
-def _terminal_status(values: dict) -> str:
+def _terminal_status(values: dict[str, Any]) -> str:
     """BUG-017: status of a run that has no pending work, from its values."""
     if values.get("active_agent") == "end":
         return "completed"
@@ -312,7 +315,7 @@ def _terminal_status(values: dict) -> str:
     return "failed"
 
 
-def _final_status(values: dict) -> str:
+def _final_status(values: dict[str, Any]) -> str:
     """BUG-017: status taxonomy for a state dict returned by a graph run."""
     if "__interrupt__" in values:
         return "awaiting_human"
@@ -331,7 +334,7 @@ def _run_status(snapshot: Any) -> str:
     return _terminal_status(values)
 
 
-async def _snapshot_or_404(task_id: str):
+async def _snapshot_or_404(task_id: str) -> StateSnapshot:
     """Fetch the checkpoint snapshot for a task; 404 if it never existed."""
     snapshot = await team_graph.aget_state(_thread_config(task_id))
     if not snapshot.values:
@@ -340,7 +343,7 @@ async def _snapshot_or_404(task_id: str):
 
 
 @app.get("/health")
-async def health_check() -> dict:
+async def health_check() -> dict[str, Any]:
     """健康检查；reports draining state during shutdown (BUG-037)."""
     return {
         "status": "ok",
@@ -412,7 +415,7 @@ async def invoke_team(request: TeamTaskRequest) -> TeamTaskResponse:
 
 
 @app.post("/tasks/human-input", dependencies=[Depends(require_api_key)])
-async def provide_human_input(request: HumanInputRequest) -> dict:
+async def provide_human_input(request: HumanInputRequest) -> dict[str, Any]:
     """提供人类输入以恢复中断的工作流（Command(resume=...)）。"""
     await _snapshot_or_404(request.task_id)
     final_state = await _run_graph(
@@ -431,7 +434,7 @@ async def provide_human_input(request: HumanInputRequest) -> dict:
 
 
 @app.get("/tasks/{task_id}/status", dependencies=[Depends(require_api_key)])
-async def get_task_status(task_id: str) -> dict:
+async def get_task_status(task_id: str) -> dict[str, Any]:
     """获取任务状态（从真实检查点快照读取）。"""
     snapshot = await _snapshot_or_404(task_id)
     values = snapshot.values
