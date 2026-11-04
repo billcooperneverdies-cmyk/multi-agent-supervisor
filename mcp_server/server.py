@@ -5,8 +5,11 @@ dict (BUG-019/040/043) so failures never traceback into the JSON-RPC protocol.
 """
 
 import logging
+from collections.abc import Coroutine
+from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
+from pydantic import BaseModel
 
 from mcp_server.tools.ask_human import AskHumanInput, ask_human
 from mcp_server.tools.errors import ToolError
@@ -37,8 +40,8 @@ logger = logging.getLogger("mcp_server.server")
 mcp = FastMCP(
     name="multi-agent-tools",
     instructions=(
-        "MCP Server exposing GitHub, Slack, and Human-in-the-Loop tools for "
-        "an AI software development team (Alice PM, Bob Frontend, Charlie Backend, Diana QA).\n"
+        "MCP Server exposing GitHub, Slack, and Human-in-the-Loop tools for an AI "
+        "software development team (Alice PM, Bob Frontend, Charlie Backend, Diana QA).\n"
         "GitHub tools: create_branch, commit_file, create_pr, read_file, list_commits, create_issue\n"
         "Slack tools: send_message, list_channels, get_channel_history\n"
         "Human tools: ask_human (for clarification requests)"
@@ -46,7 +49,7 @@ mcp = FastMCP(
 )
 
 
-async def _guard(coro) -> dict:
+async def _guard(coro: Coroutine[Any, Any, BaseModel]) -> dict[str, Any]:
     """Run a tool coroutine; map failures to a structured error dict."""
     try:
         result = await coro
@@ -64,7 +67,7 @@ async def _guard(coro) -> dict:
 async def github_create_pr_tool(
     repo_owner: str, repo_name: str, title: str, head_branch: str,
     base_branch: str = "main", body: str | None = None, draft: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Create a GitHub Pull Request."""
     return await _guard(github_create_pr(
         CreatePRInput(repo_owner=repo_owner, repo_name=repo_name, title=title,
@@ -76,7 +79,7 @@ async def github_create_pr_tool(
 @mcp.tool()
 async def github_create_branch_tool(
     repo_owner: str, repo_name: str, branch_name: str, from_branch: str = "main",
-) -> dict:
+) -> dict[str, Any]:
     """Create a new branch in a GitHub repository."""
     return await _guard(github_create_branch(
         CreateBranchInput(repo_owner=repo_owner, repo_name=repo_name,
@@ -88,7 +91,7 @@ async def github_create_branch_tool(
 async def github_commit_file_tool(
     repo_owner: str, repo_name: str, branch: str, file_path: str,
     content: str, message: str,
-) -> dict:
+) -> dict[str, Any]:
     """Commit a file to a GitHub repository branch."""
     return await _guard(github_commit_file(
         CommitFileInput(repo_owner=repo_owner, repo_name=repo_name, branch=branch,
@@ -99,7 +102,7 @@ async def github_commit_file_tool(
 @mcp.tool()
 async def github_read_file_tool(
     repo_owner: str, repo_name: str, file_path: str, branch: str = "main",
-) -> dict:
+) -> dict[str, Any]:
     """Read a file from a GitHub repository."""
     return await _guard(github_read_file(
         ReadFileInput(repo_owner=repo_owner, repo_name=repo_name,
@@ -110,7 +113,7 @@ async def github_read_file_tool(
 @mcp.tool()
 async def github_list_commits_tool(
     repo_owner: str, repo_name: str, branch: str = "main", per_page: int = 10,
-) -> dict:
+) -> dict[str, Any]:
     """List recent commits on a GitHub branch."""
     return await _guard(github_list_commits(
         ListCommitsInput(repo_owner=repo_owner, repo_name=repo_name,
@@ -122,7 +125,7 @@ async def github_list_commits_tool(
 async def github_create_issue_tool(
     repo_owner: str, repo_name: str, title: str, body: str,
     labels: list[str] | None = None, assignees: list[str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Create a GitHub Issue (e.g., for bug reports from QA)."""
     return await _guard(github_create_issue(
         CreateIssueInput(repo_owner=repo_owner, repo_name=repo_name,
@@ -136,7 +139,7 @@ async def github_create_issue_tool(
 @mcp.tool()
 async def slack_send_message_tool(
     channel: str, text: str, thread_ts: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Send a message to a Slack channel (ID or #name)."""
     return await _guard(slack_send_message(
         SendMessageInput(channel=channel, text=text, thread_ts=thread_ts)
@@ -144,7 +147,7 @@ async def slack_send_message_tool(
 
 
 @mcp.tool()
-async def slack_list_channels_tool() -> dict:
+async def slack_list_channels_tool() -> dict[str, Any]:
     """List all public Slack channels in the workspace."""
     return await _guard(slack_list_channels())
 
@@ -152,7 +155,7 @@ async def slack_list_channels_tool() -> dict:
 @mcp.tool()
 async def slack_get_channel_history_tool(
     channel: str, limit: int = 20,
-) -> dict:
+) -> dict[str, Any]:
     """Get recent messages from a Slack channel (ID or #name)."""
     return await _guard(slack_get_channel_history(
         GetChannelHistoryInput(channel=channel, limit=limit)
@@ -163,9 +166,9 @@ async def slack_get_channel_history_tool(
 
 @mcp.tool()
 async def ask_human_tool(
-    question: str, ctx: Context,
+    question: str, ctx: Context[Any, Any, Any],
     context: str | None = None, default_answer: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Ask a human for input.
 
     Uses MCP elicitation when the client supports it; otherwise returns a
