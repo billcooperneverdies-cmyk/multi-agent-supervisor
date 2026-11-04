@@ -109,11 +109,23 @@ def reset_llm_caches() -> None:
 
 
 def get_llm(model: str = "gpt-4o") -> BaseChatModel:
-    """Return the shared chat-model client (one per config, BUG-034)."""
+    """Return the shared chat-model client (one per config, BUG-034).
+
+    BUG-005: LITELLM_API_KEY has NO default. A missing key fails fast with an
+    actionable error instead of silently falling back to a well-known
+    credential that would also grant proxy-admin access.
+    """
     if _LLM_FACTORY is not None:
         return _LLM_FACTORY()
     base_url = f"{os.environ.get('LITELLM_API_BASE', 'http://localhost:4000')}/v1"
-    api_key = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
+    api_key = os.environ.get("LITELLM_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "LITELLM_API_KEY is not set. The agent authenticates to the LiteLLM "
+            "proxy with this key — set it to the proxy master key "
+            "(LITELLM_MASTER_KEY) or a proxy virtual key; see .env.example. "
+            "No default credential is provided."
+        )
     return _cached_llm(model, base_url, api_key)
 
 
