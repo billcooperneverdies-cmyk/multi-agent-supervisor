@@ -6,7 +6,7 @@ services:
   # PostgreSQL with pgvector (Vector Store + Metadata)
   # ────────────────────────────────────────────────
   postgres:
-    image: ankane/pgvector:latest
+    image: pgvector/pgvector:0.8.7-pg17-bookworm
     container_name: agent-postgres
     restart: unless-stopped
     environment:
@@ -30,7 +30,7 @@ services:
   # Unified API for OpenAI, Anthropic, local models
   # ────────────────────────────────────────────────
   litellm-proxy:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:v1.108.0
     container_name: agent-litellm
     restart: unless-stopped
     ports:
@@ -113,7 +113,7 @@ services:
   # Redis (Optional — for LangGraph checkpoint persistence)
   # ────────────────────────────────────────────────
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine3.21
     container_name: agent-redis
     restart: unless-stopped
     volumes:
