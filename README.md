@@ -73,13 +73,13 @@ python -m mcp_server.main
 ### 5. 运行四代理协作（CLI）
 
 ```bash
-python -m langgraph.agent
+python -m orchestrator.agent
 ```
 
 ### 6. 启动 FastAPI 服务
 
 ```bash
-python -m langgraph.api
+python -m orchestrator.api
 # 访问 http://localhost:8000/docs
 ```
 
@@ -117,7 +117,7 @@ multi-agent-supervisor/
 │       ├── slack.py              # 3 个 Slack 工具
 │       └── ask_human.py          # 人工介入工具
 │
-├── langgraph/                    # 编排层（LangGraph）
+├── orchestrator/                # 编排层（基于 LangGraph）
 │   ├── __init__.py
 │   ├── state_machine.py          # 四代理工作流图 + 条件路由
 │   ├── agent.py                  # CLI 交互式运行器

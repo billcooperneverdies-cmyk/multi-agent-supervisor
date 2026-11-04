@@ -6,7 +6,7 @@ import os
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
-from langgraph.state_machine import AgentState, team_graph
+from orchestrator.state_machine import AgentState, team_graph
 
 LITELLM_API_BASE = os.environ.get("LITELLM_API_BASE", "http://localhost:4000")
 LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-litellm-master-key")
