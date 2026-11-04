@@ -1,6 +1,6 @@
 [project]
 name = "multi-agent-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-Agent Supervisor: LangGraph + MCP + LiteLLM architecture"
 requires-python = ">=3.10"
 dependencies = [
